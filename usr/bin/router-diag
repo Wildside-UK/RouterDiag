@@ -9,7 +9,7 @@
 # Usage: router-diag {setup|start|stop|status|analyze|history|log|config}
 # ==========================================================
 
-VERSION="0.9.2a"
+VERSION="0.9.1a"
 PROG="router-diag"
 
 # --- Paths ---
@@ -17,17 +17,35 @@ USB_MOUNT="/mnt/usb"
 USB_DEVICE=""
 DIAG_DIR="$USB_MOUNT/router-diag"
 CONFIG_FILE="$DIAG_DIR/config.conf"
-METRICS_FILE="$DIAG_DIR/metrics.csv"
+METRICS_PATH="$DIAG_DIR/metrics.csv"
+ACTIVE_METRICS_FILE="/tmp/router-diag-active.csv"
 ANALYSIS_LOG="$DIAG_DIR/analysis.log"
+REGISTRY_FILE="$DIAG_DIR/registry.json"
 HISTORY_DIR="$DIAG_DIR/history"
 PID_FILE="/var/run/router-diag.pid"
 LOCK_FILE="/var/run/router-diag.lock"
 
+# --- Identity & Environment ---
+ROUTER_MODEL="Xunison Exigo D50"
+SITE_TYPE="Rural"
+BASE_RSRP="-112"
+BASE_SNR="5"
+MANAGED_SERVICES="dnsmasq adblock-lean https-dns-proxy firewall wifi"
+MODEM_IFACE="modem"         # The logical interface name (uci network name)
+PREFERRED_BANDS=""          # If set, Level 4 will restore these (e.g. "1 3 20")
+PREFERRED_CELL=""           # If set, Level 4 will restore this (e.g. "EARFCN,PCI")
+REBOOT_TIMEOUT_MIN=30       # Minutes without internet before Level 4 reboot
+
 # --- Defaults (overridden by config) ---
 GEMINI_API_KEY=""
 GEMINI_MODEL="gemini-2.5-flash"
-COLLECT_INTERVAL=120        # 2 minutes
-TRIGGER_RSRP=-110           # dBm
+WEATHER_API_KEY=""
+LOCATION_LAT="52.2433"
+LOCATION_LON="-2.2233"
+COLLECT_INTERVAL=120
+FLASH_SAFE_MODE=1           # 1=Write high-res to RAM, distill to Flash every 2h
+SYNC_INTERVAL_RECORDS=60     # Sync every 60 records (2 hours at 2m interval)
+TRIGGER_RSRP=-115           # dBm
 TRIGGER_LATENCY=100         # ms
 TRIGGER_CA_DROP=1            # 1=enabled
 TRIGGER_HOURLY=1             # 1=enabled
@@ -36,11 +54,17 @@ EMAIL_TO="stevemeek82@gmail.com"
 EMAIL_FROM="stevemeek82@gmail.com"
 EMAIL_APP_PASSWORD=""
 EMAIL_ENABLED=1
-MAX_FILE_SIZE=2147483648  # 2GB per file
+MAX_FILE_SIZE_MB=2048       # 2GB default
 TEMP_WARNING=85             # Default if no per-sensor config
 TEMP_CRITICAL=95            # Default if no per-sensor config
 MEM_LOW_KB=20480
 LOAD_HIGH=1.0
+SELF_HEAL_ENABLED=1         # 1=use local registry before calling API
+
+# Calculate byte limit (called after loading config)
+update_limits() {
+    MAX_FILE_SIZE=$((MAX_FILE_SIZE_MB * 1048576))
+}
 
 # Dynamic Sensors: Space-separated list of "path|label|warning|critical|enabled"
 # Example: "/sys/class/thermal/thermal_zone1/temp|CPU|85|100|1"
@@ -113,6 +137,7 @@ send_email() {
 load_config() {
     [ -f "$CONFIG_FILE" ] || return 1
     . "$CONFIG_FILE"
+    update_limits
     return 0
 }
 
@@ -121,8 +146,20 @@ save_config() {
 # RouterDiag configuration
 # Generated: $(timestamp)
 
+ROUTER_MODEL="$ROUTER_MODEL"
+SITE_TYPE="$SITE_TYPE"
+BASE_RSRP="$BASE_RSRP"
+BASE_SNR="$BASE_SNR"
+MANAGED_SERVICES="$MANAGED_SERVICES"
+MODEM_IFACE="$MODEM_IFACE"
+PREFERRED_BANDS="$PREFERRED_BANDS"
+PREFERRED_CELL="$PREFERRED_CELL"
+REBOOT_TIMEOUT_MIN=$REBOOT_TIMEOUT_MIN
 GEMINI_API_KEY="$GEMINI_API_KEY"
 GEMINI_MODEL="$GEMINI_MODEL"
+WEATHER_API_KEY="$WEATHER_API_KEY"
+LOCATION_LAT="$LOCATION_LAT"
+LOCATION_LON="$LOCATION_LON"
 COLLECT_INTERVAL=$COLLECT_INTERVAL
 TRIGGER_RSRP=$TRIGGER_RSRP
 TRIGGER_LATENCY=$TRIGGER_LATENCY
@@ -133,15 +170,18 @@ EMAIL_TO="$EMAIL_TO"
 EMAIL_FROM="$EMAIL_FROM"
 EMAIL_APP_PASSWORD="$EMAIL_APP_PASSWORD"
 EMAIL_ENABLED=$EMAIL_ENABLED
-MAX_FILE_SIZE=$MAX_FILE_SIZE
+MAX_FILE_SIZE_MB=$MAX_FILE_SIZE_MB
+METRICS_PATH="$METRICS_PATH"
 TEMP_WARNING=$TEMP_WARNING
 TEMP_CRITICAL=$TEMP_CRITICAL
 MEM_LOW_KB=$MEM_LOW_KB
 LOAD_HIGH=$LOAD_HIGH
 SENSORS="$SENSORS"
+SELF_HEAL_ENABLED=$SELF_HEAL_ENABLED
 CONF
     chmod 600 "$CONFIG_FILE"
 
+    update_limits
     # Keep msmtprc in sync
     [ -n "$EMAIL_APP_PASSWORD" ] && _write_msmtprc
 }
@@ -213,6 +253,15 @@ cmd_config() {
     if [ -z "$val" ]; then
         # Show single value
         case "$key" in
+            model_name)        echo "$ROUTER_MODEL" ;;
+            site_type)         echo "$SITE_TYPE" ;;
+            rsrp_base)         echo "$BASE_RSRP" ;;
+            snr_base)          echo "$BASE_SNR" ;;
+            services)          echo "$MANAGED_SERVICES" ;;
+            modem_iface)       echo "$MODEM_IFACE" ;;
+            pref_bands)        echo "$PREFERRED_BANDS" ;;
+            pref_cell)         echo "$PREFERRED_CELL" ;;
+            reboot_timeout)    echo "$REBOOT_TIMEOUT_MIN" ;;
             api_key)           echo "$GEMINI_API_KEY" ;;
             model)             echo "$GEMINI_MODEL" ;;
             interval)          echo "$COLLECT_INTERVAL" ;;
@@ -225,6 +274,8 @@ cmd_config() {
             email_from)        echo "$EMAIL_FROM" ;;
             email_app_password) echo "${EMAIL_APP_PASSWORD:+[set]}${EMAIL_APP_PASSWORD:-[not set]}" ;;
             email_enabled)     echo "$EMAIL_ENABLED" ;;
+            metrics_path)      echo "$METRICS_PATH" ;;
+            metrics_max_size)  echo "$MAX_FILE_SIZE_MB" ;;
             temp_warning)      echo "$TEMP_WARNING" ;;
             temp_critical)     echo "$TEMP_CRITICAL" ;;
             mem_low)           echo "$MEM_LOW_KB" ;;
@@ -236,6 +287,15 @@ cmd_config() {
 
     # Set value
     case "$key" in
+        model_name)        ROUTER_MODEL="$val" ;;
+        site_type)         SITE_TYPE="$val" ;;
+        rsrp_base)         BASE_RSRP="$val" ;;
+        snr_base)          BASE_SNR="$val" ;;
+        services)          MANAGED_SERVICES="$val" ;;
+        modem_iface)       MODEM_IFACE="$val" ;;
+        pref_bands)        PREFERRED_BANDS="$val" ;;
+        pref_cell)         PREFERRED_CELL="$val" ;;
+        reboot_timeout)    REBOOT_TIMEOUT_MIN="$val" ;;
         api_key)           GEMINI_API_KEY="$val" ;;
         model)             GEMINI_MODEL="$val" ;;
         interval)          COLLECT_INTERVAL="$val" ;;
@@ -248,6 +308,14 @@ cmd_config() {
         email_from)        EMAIL_FROM="$val" ;;
         email_app_password) EMAIL_APP_PASSWORD="$val" ;;
         sensors)           SENSORS="$val" ;;
+        weather_api_key)   WEATHER_API_KEY="$val" ;;
+        lat)               LOCATION_LAT="$val" ;;
+        lon)               LOCATION_LON="$val" ;;
+        self_heal)         SELF_HEAL_ENABLED="$val" ;;
+        flash_safe)        FLASH_SAFE_MODE="$val" ;;
+        sync_records)      SYNC_INTERVAL_RECORDS="$val" ;;
+        metrics_path)      METRICS_PATH="$val" ;;
+        metrics_max_size)  MAX_FILE_SIZE_MB="$val" ;;
         email_enabled)
             case "$val" in
                 0|1) EMAIL_ENABLED="$val" ;;
@@ -561,18 +629,69 @@ _setup_email() {
         fi
     fi
 
+    _setup_modem
+}
+
+_setup_modem() {
+    # Step 4: Modem/WAN Interface
+    echo ""
+    echo "--- Step 4: Modem/WAN Interface ---"
+    echo ""
+    echo "Select the logical interface for your LTE/5G modem (found in /etc/config/network)."
+    
+    local ifaces
+    ifaces=$(uci show network | grep "=interface" | cut -d'=' -f1 | cut -d'.' -f2 | xargs)
+    echo "Available: $ifaces"
+    echo -n "Interface name [${MODEM_IFACE:-modem}]: "
+    read input_iface
+    [ -n "$input_iface" ] && MODEM_IFACE="$input_iface"
+
+    echo ""
+    echo "Detecting current modem configuration..."
+    
+    # Detect Current Bands
+    local cur_bands
+    cur_bands=$(modemband.sh getbands 2>/dev/null | xargs)
+    
+    # Detect Current Cell Lock
+    local cur_cell="" raw_lock
+    raw_cell=$(at_cmd 'AT+QNWLOCK="common/4g"')
+    if echo "$raw_cell" | grep -q "+QNWLOCK: \"common/4g\",1"; then
+        cur_cell=$(echo "$raw_cell" | grep "+QNWLOCK:" | awk -F',' '{printf "%s,%s", $3, $4}')
+    fi
+
+    echo "Preferred Setup (for offline recovery auto-restoration):"
+    
+    if [ -n "$cur_bands" ]; then
+        echo -n "Bands to lock to [Detected: $cur_bands]: "
+    else
+        echo -n "Bands to lock to (e.g. '1 3 20' or 'skip'): "
+    fi
+    read input_bands
+    [ -z "$input_bands" ] && PREFERRED_BANDS="$cur_bands"
+    [ "$input_bands" != "skip" ] && [ -n "$input_bands" ] && PREFERRED_BANDS="$input_bands"
+
+    if [ -n "$cur_cell" ]; then
+        echo -n "Cell to lock to [Detected: $cur_cell]: "
+    else
+        echo -n "Cell to lock to (e.g. 'EARFCN,PCI' or 'skip'): "
+    fi
+    read input_cell
+    [ -z "$input_cell" ] && PREFERRED_CELL="$cur_cell"
+    [ "$input_cell" != "skip" ] && [ -n "$input_cell" ] && PREFERRED_CELL="$input_cell"
+
     _setup_finish
 }
 
 _setup_finish() {
-    # Step 4: Save config
+    # Step 5: Save config
     echo ""
-    echo "--- Step 4: Configuration ---"
+    echo "--- Step 5: Finalising Configuration ---"
     save_config
 
     # Initialize metrics CSV with header
-    if [ ! -f "$METRICS_FILE" ]; then
-        echo "timestamp,rsrp,rsrq,rssi,snr,latency_ms,dl_bytes,ul_bytes,load_1m,mem_free_kb,temp1,temp2" > "$METRICS_FILE"
+    if [ ! -f "$METRICS_PATH" ]; then
+        echo "timestamp,rsrp,rsrq,rssi,snr,latency_ms,dl_bytes,ul_bytes,load_1m,mem_free_kb,temp1,temp2" > "$METRICS_PATH"
     fi
 
     # Initialize analysis log
@@ -591,6 +710,116 @@ _setup_finish() {
     echo "Adjust settings:     $PROG config <key> <value>"
     echo ""
     echo "Configuration saved to: $CONFIG_FILE"
+}
+
+collect_weather() {
+    # Returns: condition|temp|humidity
+    [ -n "$WEATHER_API_KEY" ] || { echo "none|0|0"; return; }
+
+    local res
+    res=$(curl -s --max-time 5 "https://api.openweathermap.org/data/2.5/weather?lat=$LOCATION_LAT&lon=$LOCATION_LON&appid=$WEATHER_API_KEY&units=metric" 2>/dev/null)
+    [ -n "$res" ] || { echo "error|0|0"; return; }
+
+    local desc temp hum
+    desc=$(echo "$res" | jsonfilter -e '@.weather[0].description' 2>/dev/null)
+    temp=$(echo "$res" | jsonfilter -e '@.main.temp' 2>/dev/null)
+    hum=$(echo "$res" | jsonfilter -e '@.main.humidity' 2>/dev/null)
+
+    echo "${desc:-unknown}|${temp:-0}|${hum:-0}"
+}
+
+collect_bands() {
+    # Returns: current band info (e.g., "B1 (PCC) + B3 (SCC)")
+    local raw
+    raw=$(at_cmd 'AT+ZCAINFO?')
+    [ -n "$raw" ] || return
+
+    # Parse AT+ZCAINFO? output
+    # Example format: +ZCAINFO: PCC,earfcn,band,pci,bandwidth...
+    local bands
+    bands=$(echo "$raw" | grep "+ZCAINFO:" | sed 's/+ZCAINFO: //' | awk -F',' '{
+        type=$1; band=$3;
+        if(type=="PCC") printf "%s (PCC) ", band;
+        else if(type=="SCC") printf "+ %s (SCC) ", band;
+    }' | sed 's/ $//')
+
+    echo "${bands:-Unknown}"
+}
+
+# --- Self-Healing Registry ---
+
+# Generate a symptom hash based on health failed services and log triggers
+get_symptom_hash() {
+    local logs
+    logs=$(cat /tmp/router-diag-log-errors 2>/dev/null || echo "")
+    printf "%s|%s" "$HEALTH_FAILED_SERVICES" "$logs" | md5sum | cut -d' ' -f1
+}
+
+check_registry() {
+    local hash="$1"
+    [ -f "$REGISTRY_FILE" ] || return 1
+    
+    # Simple JSON parsing for action
+    grep "\"$hash\":" "$REGISTRY_FILE" | sed -n 's/.*"action": "\(.*\)".*/\1/p'
+}
+
+update_registry() {
+    local hash="$1" action="$2" status="$3"
+    [ "$status" = "OK" ] || return 0 # Only store successful fixes
+    
+    # Minimalistic JSON store update
+    if [ ! -f "$REGISTRY_FILE" ]; then
+        echo "{\"$hash\": {\"action\": \"$action\", \"last_success\": \"$(timestamp)\"}}" > "$REGISTRY_FILE"
+    else
+        # Remove existing entry for this hash if it exists
+        sed -i "/\"$hash\":/d" "$REGISTRY_FILE"
+        # Append new entry (very rough JSON management)
+        sed -i '$ s/}/,/' "$REGISTRY_FILE"
+        echo "  \"$hash\": {\"action\": \"$action\", \"last_success\": \"$(timestamp)\"}}" >> "$REGISTRY_FILE"
+    fi
+}
+
+# --- Intelligent Data Distillation ---
+
+distill_metrics() {
+    local data_file="$1"
+    [ -s "$data_file" ] || return 1
+
+    local block_data
+    block_data=$(cat "$data_file")
+
+    local prompt
+    prompt=$(cat << PROMPT
+You are a data compression engine for an LTE router.
+Below is a 2-hour block of metrics (60 entries, 2-minute intervals).
+Distill these into a SINGLE "Representative Entry" that best captures the state of the system during this period.
+
+PRIORITIES:
+1. If there were spikes in temperature or latency, ensure the representative values reflect those peaks.
+2. Use averages for RSRP/SNR unless there were significant drops.
+3. Keep the CSV format EXACTLY as: YYYY-MM-DD HH:MM:SS,rsrp,rsrq,rssi,snr,lat,dl,ul,load,mem,temp1,temp2...
+4. Return ONLY the single CSV line. No text, no markdown.
+
+DATA BLOCK:
+$block_data
+PROMPT
+)
+
+    local distilled
+    distilled=$(gemini_request "$prompt" "distiller")
+    
+    if [ -n "$distilled" ] && echo "$distilled" | grep -q ","; then
+        # Clean potential markdown or whitespace
+        distilled=$(echo "$distilled" | tr -d '`' | grep ",")
+        echo "$distilled" >> "$METRICS_PATH"
+        log_msg "FLASH-SAFE: Distilled 2-hour block into 1 persistent record."
+        # Clear active RAM log
+        : > "$ACTIVE_METRICS_FILE"
+        return 0
+    fi
+
+    log_err "FLASH-SAFE: Distillation failed. Retaining active log."
+    return 1
 }
 
 # ==========================================================
@@ -635,7 +864,7 @@ collect_latency() {
 collect_throughput() {
     # Returns: dl_bytes ul_bytes (delta since last call)
     # Uses /proc/net/dev for the WAN interface (wwan0 typically)
-    local iface="wwan0"
+    local iface=$(uci -q get network.${MODEM_IFACE}.l3_device || echo "rmnet_mhi0.1")
     local stats
     stats=$(grep "$iface" /proc/net/dev 2>/dev/null | tr -s ' ')
 
@@ -907,6 +1136,58 @@ collect_dhcp_status() {
 # Status Display
 # ==========================================================
 
+# --- Emergency Offline Recovery ---
+
+escalate_emergency_recovery() {
+    local fail_file="/tmp/router-diag-offline-since"
+    local now
+    now=$(epoch)
+
+    if [ ! -f "$fail_file" ]; then
+        echo "$now" > "$fail_file"
+        return 0
+    fi
+
+    local start_time elapsed_mins
+    start_time=$(cat "$fail_file")
+    elapsed_mins=$(( (now - start_time) / 60 ))
+
+    log_msg "EMERGENCY: Internet unreachable for ${elapsed_mins}m. Escalating triage..."
+
+    # Recovery Levels
+    if [ "$elapsed_mins" -ge "$REBOOT_TIMEOUT_MIN" ]; then
+        # Level 4: The Nuclear Option
+        log_msg "EMERGENCY LEVEL 4: Timed out ($elapsed_mins >= $REBOOT_TIMEOUT_MIN). REBOOTING SYSTEM."
+        echo "REBOOT_REQUIRED_$(date +%s)" > /tmp/router-diag-last-action
+        sync
+        reboot
+    elif [ "$elapsed_mins" -ge 20 ]; then
+        # Level 3: Service Refresh + Final Band Scrub
+        log_msg "EMERGENCY LEVEL 3: Refreshing Auth Services & Bands"
+        modemband.sh setbands default >/dev/null 2>&1
+        $SMS_TOOL -d "$AT_PORT" at 'AT+ZLOCKCELL=0' >/dev/null 2>&1
+        for svc in $MANAGED_SERVICES; do
+            /etc/init.d/"$svc" restart >/dev/null 2>&1
+        done
+        # Record this for post-mortem
+        echo "LEVEL_3_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
+    elif [ "$elapsed_mins" -ge 10 ]; then
+        # Level 2: Modem Kick (Reset Bands)
+        log_msg "EMERGENCY LEVEL 2: Resetting Modem Bands"
+        modemband.sh setbands default >/dev/null 2>&1
+        # Also unlock any cell locks if sms_tool supports it
+        $SMS_TOOL -d "$AT_PORT" at 'AT+ZLOCKCELL=0' >/dev/null 2>&1
+        echo "LEVEL_2_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
+    elif [ "$elapsed_mins" -ge 2 ]; then
+        # Level 1: Soft Reset (Interface Bounce)
+        log_msg "EMERGENCY LEVEL 1: Bouncing Modem Interface ($MODEM_IFACE)"
+        ifdown "$MODEM_IFACE" >/dev/null 2>&1
+        sleep 5
+        ifup "$MODEM_IFACE" >/dev/null 2>&1
+        echo "LEVEL_1_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
+    fi
+}
+
 cmd_status() {
     echo "=== router-diag Status ==="
     echo ""
@@ -938,9 +1219,9 @@ cmd_status() {
     fi
 
     # Metrics file
-    if [ -f "$METRICS_FILE" ]; then
+    if [ -f "$METRICS_PATH" ]; then
         local lines
-        lines=$(wc -l < "$METRICS_FILE")
+        lines=$(wc -l < "$METRICS_PATH")
         lines=$((lines - 1))  # minus header
         echo "Metrics:  $lines records"
     else
@@ -1080,8 +1361,8 @@ cmd_luci_json() {
 
     # --- Metrics count ---
     local metrics_count=0
-    if [ -f "$METRICS_FILE" ]; then
-        metrics_count=$(wc -l < "$METRICS_FILE")
+    if [ -f "$METRICS_PATH" ]; then
+        metrics_count=$(wc -l < "$METRICS_PATH")
         metrics_count=$((metrics_count - 1))
         [ "$metrics_count" -lt 0 ] && metrics_count=0
     fi
@@ -1144,6 +1425,24 @@ cmd_luci_json() {
         fixes_json="$fixes_json{\"service\":\"$svc_name\",\"count\":$fcount,\"mins_ago\":$fmins}"
     done
 
+    # --- Historical metrics (last 100) ---
+    local history_json=""
+    local source_file="$METRICS_PATH"
+    [ "$FLASH_SAFE_MODE" = "1" ] && [ -s "$ACTIVE_METRICS_FILE" ] && source_file="$ACTIVE_METRICS_FILE"
+
+    if [ -f "$source_file" ]; then
+        history_json=$(tail -n 100 "$source_file" | awk -F',' '
+            NR > 1 {
+                # Format: ["timestamp",rsrp,rsrq,rssi,snr,lat,dl,ul,load,mem,temp1,temp2...]
+                printf "[\"%s\",%s,%s,%s,%s,%s,%s,%s,%s,%s", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+                for(i=11; i<=NF; i++) printf ",%s", $i
+                printf "]"
+                if(NR != 100 && !eof) printf ","
+            }
+        ' ORS='')
+        history_json=$(echo "$history_json" | sed 's/,$//')
+    fi
+
     # --- Last analysis excerpt ---
     local last_analysis=""
     if [ -f "$ANALYSIS_LOG" ]; then
@@ -1192,6 +1491,8 @@ cmd_luci_json() {
     "latency_ms": "$last_latency",
     "load_1m": "$last_load",
     "mem_free_kb": "$last_mem",
+    "weather": "$(collect_weather)",
+    "bands": "$(collect_bands)",
     "sensors": [${sensor_vals:-0}]
   },
   "health": {
@@ -1200,17 +1501,32 @@ cmd_luci_json() {
     "seconds_ago": ${health_ago:-null}
   },
   "fixes": [${fixes_json}],
+  "history": [${history_json}],
   "last_analysis": "$esc_analysis",
   "sensors_detected": $(cmd_detect_sensors),
   "config": {
+    "model_name": "$ROUTER_MODEL",
+    "site_type": "$SITE_TYPE",
+    "rsrp_base": "$BASE_RSRP",
+    "snr_base": "$BASE_SNR",
+    "services": "$MANAGED_SERVICES",
+    "modem_iface": "$MODEM_IFACE",
+    "pref_bands": "$PREFERRED_BANDS",
+    "pref_cell": "$PREFERRED_CELL",
+    "reboot_timeout": "$REBOOT_TIMEOUT_MIN",
     "latency_threshold": "$TRIGGER_LATENCY",
     "hourly_check": "$TRIGGER_HOURLY",
     "api_cooldown": "$API_COOLDOWN",
     "email_enabled": "$EMAIL_ENABLED",
     "email_to": "$EMAIL_TO",
     "collect_interval": "$COLLECT_INTERVAL",
-    "max_file_size_mb": "$((MAX_FILE_SIZE / 1048576))",
-    "sensors": "$SENSORS"
+    "metrics_path": "$METRICS_PATH",
+    "metrics_max_size": "$MAX_FILE_SIZE_MB",
+    "sensors": "$SENSORS",
+    "weather_api_key": "$([ -n "$WEATHER_API_KEY" ] && echo "Configured" || echo "")",
+    "self_heal": "$SELF_HEAL_ENABLED",
+    "flash_safe": "$FLASH_SAFE_MODE",
+    "sync_records": "$SYNC_INTERVAL_RECORDS"
   }
 }
 JSONEOF
@@ -1222,6 +1538,7 @@ JSONEOF
 
 gemini_request() {
     local prompt="$1"
+    local mode="${2:-analyst}"
     local response
 
     [ -n "$GEMINI_API_KEY" ] || {
@@ -1229,7 +1546,13 @@ gemini_request() {
         return 1
     }
 
-    # Escape the prompt for JSON (handle quotes, newlines, control chars)
+    local system_instr="You are a network diagnostics expert for a ${ROUTER_MODEL:-OpenWrt} LTE router ($SITE_TYPE). Analyze metrics and provide specific, actionable recommendations. Format your response as:\nSTATUS: [GOOD|WARNING|CRITICAL]\nDIAGNOSIS: [1-2 sentence summary]\nRECOMMENDATIONS:\n- [specific action 1]\n- [specific action 2]\nACTION: [action type]\n\nACTION types:\n- none — everything is fine, no action needed\n- restart_service:name — restart a specific service (Authorized services: ${MANAGED_SERVICES:-dnsmasq})\n- reload_firewall — reload firewall rules\n- band_slam:\"bands\" — force the modem to specific LTE bands (e.g., band_slam:\"1 3 20\") if signal is poor or CA dropped. Use this when current bands show low SNR or high latency compared to typical performance.\n- restart_wifi — restart WiFi radios (only if SSIDs stopped broadcasting)\n- flush_arp — flush ARP cache (if pings fail but net looks healthy)\n- investigate_dns — DNS broken, auto-fixes exhausted\n- investigate_network — complex issue, needs human\n\nContext provided includes local weather (to correlate environmental interference like rain fade) and current LTE bands. Use the log entries to identify root causes. If temperature is critical, the tool will automatically kill heavy processes.\n\nIMPORTANT: Unreachable devices are INFORMATIONAL ONLY. Devices go offline, sleep, leave the network — this is completely normal. Do NOT recommend restart_wifi based on unreachable device counts.\n\nIMPORTANT: The traffic volume metric is NOT a speed test. Low traffic volume simply means nothing was being actively downloaded — it does NOT indicate a slow connection.\n\nIMPORTANT: Check RECENT AUTO-FIX ATTEMPTS. If a service has already been restarted 2+ times in the last hour, do NOT recommend restarting it again.\n\nIMPORTANT: LTE signal strength (RSRP) around ${BASE_RSRP:- -110} dBm and SNR around ${BASE_SNR:-5} dB is the NORMAL BASELINE for this location. Do NOT flag these baseline values as an issue. Only flag if RSRP drops significantly below baseline AND SNR drops simultaneously."
+
+    if [ "$mode" = "distiller" ]; then
+        system_instr="You are a data compression engine for LTE router telemetry. Your goal is to distill a block of 60 high-resolution CSV entries (2 hours) into a SINGLE representative CSV line for persistent storage. Ensure peaks in temperature and load are preserved, while signal values are averaged. Return ONLY the CSV line."
+    fi
+
+    # Escape the prompt for JSON
     local escaped_prompt
     escaped_prompt=$(printf '%s' "$prompt" | tr -d '\r' | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g')
 
@@ -1247,7 +1570,13 @@ gemini_request() {
   },
   "systemInstruction": {
     "parts": [{
-      "text": "You are a network diagnostics expert for an MF286D LTE router running OpenWRT with TCP BBR congestion control. Analyze metrics and provide specific, actionable recommendations. Format your response as:\nSTATUS: [GOOD|WARNING|CRITICAL]\nDIAGNOSIS: [1-2 sentence summary]\nRECOMMENDATIONS:\n- [specific action 1]\n- [specific action 2]\nACTION: [action type]\n\nACTION types:\n- none — everything is fine, no action needed\n- restart_service:name — restart a specific service (e.g., restart_service:dnsmasq, restart_service:adblock-lean, restart_service:https-dns-proxy)\n- reload_firewall — reload firewall rules via /etc/init.d/firewall restart\n- restart_wifi — restart all WiFi radios (ONLY if SSIDs have stopped broadcasting)\n- flush_arp — flush the ARP cache (safe, use when pings fail but network looks healthy)\n- investigate_dns — DNS is broken and auto-fixes exhausted, needs manual diagnosis\n- investigate_network — complex network issue, needs human investigation\n\nMonitored services: dnsmasq (DNS+DHCP), https-dns-proxy (DoH), firewall (nftables), adblock-lean (ad blocking), WiFi (main+IoT SSIDs). DHCP lease status and device reachability (ping) are included. System logs from logread are provided — use these to identify root causes of failures rather than guessing. Log entries show the actual error messages from crashed services, kernel warnings, OOM events, and interface state changes. Network conflict detection runs each cycle: IP conflicts (auto-fixed when DHCP client involved), duplicate MACs, and rogue static IPs are reported. WiFi thrash detection monitors for devices rapidly associating/disassociating — thrashing devices are auto-blocked temporarily and unblocked after a cooldown. System health monitors temperature (warning 80C, critical 85C), memory (alert below 20MB free), and load. If temperature is critical AND load > 1.0, the heaviest non-essential process is automatically killed. All conflicts, blocks, and system actions already handled are shown for context.\n\nIMPORTANT: Unreachable devices are INFORMATIONAL ONLY and NEVER a reason to take action. Devices go offline, sleep, leave the network — this is completely normal at all hours. Do NOT recommend restart_wifi, flush_arp, or any action based on unreachable device counts. Only recommend WiFi restart if SSIDs have actually stopped broadcasting (shown in service health checks).\n\nIMPORTANT: The traffic volume metric shows bytes transferred on the WAN interface during the collection interval. This is NOT a speed test. Low traffic volume simply means nothing was being actively downloaded at that moment — it does NOT indicate a slow or degraded connection. Never diagnose throughput or speed problems from this metric alone.\n\nIMPORTANT: Check RECENT AUTO-FIX ATTEMPTS in the prompt. If a service or interface has already been restarted 2+ times in the last hour, do NOT recommend restarting it again — use investigate_dns or investigate_network instead.\n\nIMPORTANT: LTE signal strength (RSRP) between -100 and -112 dBm is the NORMAL BASELINE for this fixed installation. This router is in a rural location and has always operated in this range. Do NOT flag RSRP values in this range as warnings or issues. Do NOT recommend antenna repositioning, external antennas, or investigation for signal strength alone. Only flag signal as a problem if RSRP drops below -115 dBm AND SNR drops below 5 dB simultaneously, indicating genuine signal degradation rather than normal fluctuation. NEVER use investigate_network for LTE signal strength — signal strength is not actionable and not a network issue."
+      "text": "$system_instr"
+    }]
+  }
+}
+JSONEOF
+)
+      "text": "You are a network diagnostics expert for an MF286D LTE router running OpenWRT. Analyze metrics and provide specific, actionable recommendations. Format your response as:\nSTATUS: [GOOD|WARNING|CRITICAL]\nDIAGNOSIS: [1-2 sentence summary]\nRECOMMENDATIONS:\n- [specific action 1]\n- [specific action 2]\nACTION: [action type]\n\nACTION types:\n- none — everything is fine, no action needed\n- restart_service:name — restart a specific service (e.g., dnsmasq, adblock-lean, https-dns-proxy)\n- reload_firewall — reload firewall rules\n- band_slam:"bands" — force the modem to specific LTE bands (e.g., band_slam:\"1 3 20\") if signal is poor or CA dropped. Use this when current bands show low SNR or high latency compared to typical performance.\n- restart_wifi — restart WiFi radios (only if SSIDs stopped broadcasting)\n- flush_arp — flush ARP cache (if pings fail but net looks healthy)\n- investigate_dns — DNS broken, auto-fixes exhausted\n- investigate_network — complex issue, needs human\n\nContext provided includes local weather (to correlate environmental interference like rain fade) and current LTE bands. Use the log entries to identify root causes. If temperature is critical, the tool will automatically kill heavy processes.\n\nIMPORTANT: Unreachable devices are INFORMATIONAL ONLY and NEVER a reason to take action. Devices go offline, sleep, leave the network — this is completely normal. Do NOT recommend restart_wifi based on unreachable device counts.\n\nIMPORTANT: The traffic volume metric is NOT a speed test. Low traffic volume simply means nothing was being actively downloaded — it does NOT indicate a slow connection. Never diagnose throughput problems from this metric alone.\n\nIMPORTANT: Check RECENT AUTO-FIX ATTEMPTS. If a service has already been restarted 2+ times in the last hour, do NOT recommend restarting it again — use investigate_dns or investigate_network instead.\n\nIMPORTANT: LTE signal strength (RSRP) between -100 and -112 dBm is the NORMAL BASELINE for this location. Do NOT flag this range as an issue. Only flag if RSRP drops below -115 dBm AND SNR drops below 5 dB simultaneously."
     }]
   }
 }
@@ -1261,9 +1590,14 @@ JSONEOF
         -d "$payload" 2>/dev/null)
 
     if [ -z "$response" ]; then
-        log_err "Empty response from Gemini API"
+        log_err "Network error: Empty response from Gemini API"
+        # Trigger offline recovery triage
+        escalate_emergency_recovery
         return 1
     fi
+
+    # Internet is working if we reached here
+    rm -f /tmp/router-diag-offline-since
 
     # Check for errors (jsonfilter for robust JSON parsing)
     local err_msg
@@ -1299,8 +1633,8 @@ METRICS
 
     # Get recent history (last 12 readings = ~1 hour)
     local history=""
-    if [ -f "$METRICS_FILE" ]; then
-        history=$(tail -12 "$METRICS_FILE" | head -11)
+    if [ -f "$METRICS_PATH" ]; then
+        history=$(tail -12 "$METRICS_PATH" | head -11)
     fi
 
     # Get health context
@@ -1331,8 +1665,15 @@ METRICS
     done
 
     # Build prompt
+    local weather bands
+    weather=$(collect_weather)
+    bands=$(collect_bands)
+
     cat << PROMPT
 Analyze this LTE router diagnostic data. Trigger: $trigger_reason
+
+LOCAL WEATHER: $weather
+CURRENT BANDS: $bands
 
 CURRENT METRICS ($ts):
 - Signal: RSRP=${rsrp}dBm, RSRQ=${rsrq}dB, SNR=${snr}dB
@@ -1366,6 +1707,9 @@ $([ -n "$history" ] && echo "$history" || echo "No history yet")
 SYSTEM LOGS (recent relevant entries):
 $(collect_recent_logs | tail -30)
 
+OFFLINE RECOVERY POST-MORTEM:
+$([ -f /tmp/router-diag-last-action ] && { echo "The router was recently OFFLINE and applied a local fix: $(cat /tmp/router-diag-last-action). Analyze if this fix was appropriate based on the logs below."; rm -f /tmp/router-diag-last-action; } || echo "No recent offline actions.")
+
 LOG ERRORS DETECTED:
 $([ -f /tmp/router-diag-log-errors ] && cat /tmp/router-diag-log-errors || echo "None")
 
@@ -1376,6 +1720,28 @@ PROMPT
 run_analysis() {
     local metrics="$1"
     local trigger="$2"
+
+    [ -n "$GEMINI_API_KEY" ] || {
+        log_err "No API key configured"
+        return 1
+    }
+
+    # --- Self-Healing Registry Check ---
+    local symptom_hash cached_action
+    symptom_hash=$(get_symptom_hash)
+    if [ "$SELF_HEAL_ENABLED" = "1" ]; then
+        cached_action=$(check_registry "$symptom_hash")
+        if [ -n "$cached_action" ]; then
+            log_msg "SELF-HEAL: Found cached fix for symptom $symptom_hash: $cached_action"
+            if apply_action "$cached_action" "self-heal"; then
+                echo "=== Self-Heal: $(timestamp) ===" >> "$ANALYSIS_LOG"
+                echo "Applied cached action: $cached_action" >> "$ANALYSIS_LOG"
+                echo "---" >> "$ANALYSIS_LOG"
+                return 0
+            fi
+            log_msg "SELF-HEAL: Cached fix failed, proceeding to Gemini API"
+        fi
+    fi
 
     local prompt
     prompt=$(build_analysis_prompt "$metrics" "$trigger")
@@ -1409,42 +1775,71 @@ run_analysis() {
     [ -n "$action" ] || action="none"
 
     # Handle actions autonomously
+    if apply_action "$action" "$result"; then
+        [ "$action" != "none" ] && update_registry "$symptom_hash" "$action" "OK"
+    fi
+
+    echo "---" >> "$ANALYSIS_LOG"
+    echo "" >> "$ANALYSIS_LOG"
+}
+
+apply_action() {
+    local action="$1"
+    local full_result="$2"
+    local status="GOOD" # default
+    [ "$full_result" != "self-heal" ] && status=$(echo "$full_result" | grep -oE 'STATUS:[[:space:]]*(GOOD|WARNING|CRITICAL)' | sed 's/STATUS:[[:space:]]*//')
+
     case "$action" in
         restart_service:*)
             local svc
             svc=$(echo "$action" | sed 's/restart_service://')
-            log_msg "GEMINI: Restart service $svc recommended"
+            log_msg "ACTION: Restart service $svc recommended"
             if attempt_fix_service "$svc"; then
                 echo "[AUTO-APPLIED] Service restart: $svc ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 0
             else
                 echo "[FAILED] Service restart: $svc ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 1
             fi
             ;;
         reload_firewall)
-            log_msg "GEMINI: Firewall reload recommended"
+            log_msg "ACTION: Firewall reload recommended"
             if attempt_fix_firewall; then
                 echo "[AUTO-APPLIED] Firewall reload ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 0
             else
                 echo "[FAILED] Firewall reload ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 1
             fi
             ;;
-        restart_interface:*)
-            local iface
-            iface=$(echo "$action" | sed 's/restart_interface://')
-            # SAFETY: Block ALL interface restarts — use investigate_network instead
-            log_msg "BLOCKED: Refusing to restart interface $iface (all interface restarts disabled)"
-            echo "[BLOCKED] Interface restart: $iface - all interface restarts disabled ($(timestamp))" >> "$ANALYSIS_LOG"
+        band_slam:*)
+            local bands
+            bands=$(echo "$action" | sed 's/band_slam://' | tr -d '"')
+            log_msg "ACTION: Band-Slamming to: $bands"
+            if modemband.sh setbands "$bands" >/dev/null 2>&1; then
+                log_msg "ACTION: Bands set successfully"
+                echo "[AUTO-APPLIED] Band-Slam: $bands ($(timestamp))" >> "$ANALYSIS_LOG"
+                epoch > /tmp/router-diag-last-fix
+                send_email "[router-diag] Auto-fix applied — Bands Optimised" \
+                    "Bands locked to: $bands\nBased on AI recommendation for current conditions.\n\nTime: $(timestamp)"
+                return 0
+            else
+                log_err "ACTION: Band-Slam failed"
+                return 1
+            fi
             ;;
         restart_wifi)
-            log_msg "GEMINI: WiFi restart recommended"
+            log_msg "ACTION: WiFi restart recommended"
             if attempt_fix_wifi; then
                 echo "[AUTO-APPLIED] WiFi restart ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 0
             else
                 echo "[FAILED] WiFi restart ($(timestamp))" >> "$ANALYSIS_LOG"
+                return 1
             fi
             ;;
         flush_arp)
-            log_msg "GEMINI: ARP cache flush recommended"
+            log_msg "ACTION: ARP cache flush recommended"
             local before_entries
             before_entries=$(ip neigh show 2>/dev/null | grep -c "" || echo "0")
             ip neigh flush all 2>/dev/null
@@ -1455,18 +1850,21 @@ run_analysis() {
             epoch > /tmp/router-diag-last-fix
             send_email "[router-diag] Auto-fix applied — ARP cache flushed" \
                 "ARP cache flushed to resolve stale entries.\n\nBefore: $before_entries ARP entries\nAfter:  $after_entries ARP entries (will repopulate as devices communicate)\n\nTime: $(timestamp)"
+            return 0
             ;;
         investigate_dns)
             log_msg "NOTIFY: DNS investigation needed — sending email"
             echo "[EMAIL] DNS investigation needed ($(timestamp))" >> "$ANALYSIS_LOG"
             send_email "[router-diag] DNS broken — investigation needed" \
-                "Trigger: $trigger\n\nAutomatic fixes have been exhausted. DNS resolution is failing.\n\nFull diagnosis:\n$result\n\nManual investigation required."
+                "Automatic fixes have been exhausted. DNS resolution is failing.\n\nFull diagnosis:\n$full_result\n\nManual investigation required."
+            return 0
             ;;
         investigate_network)
             log_msg "NOTIFY: Network investigation needed — sending email"
             echo "[EMAIL] Network investigation needed ($(timestamp))" >> "$ANALYSIS_LOG"
             send_email "[router-diag] Network issue — investigation needed" \
-                "Trigger: $trigger\n\nAutomatic fixes have been exhausted or the issue is too complex.\n\nFull diagnosis:\n$result\n\nManual investigation required."
+                "Automatic fixes have been exhausted or the issue is too complex.\n\nFull diagnosis:\n$full_result\n\nManual investigation required."
+            return 0
             ;;
         none)
             # CRITICAL status always gets an email even with no action
@@ -1474,19 +1872,18 @@ run_analysis() {
                 log_msg "NOTIFY: CRITICAL status — sending email"
                 echo "[EMAIL] Critical status notification sent ($(timestamp))" >> "$ANALYSIS_LOG"
                 send_email "[router-diag] CRITICAL — attention needed" \
-                    "Trigger: $trigger\n\nFull diagnosis:\n$result"
+                    "Full diagnosis:\n$full_result"
             fi
             # Mark log errors as assessed so identical entries don't re-trigger
             [ -f /tmp/router-diag-log-hash ] && \
                 cp /tmp/router-diag-log-hash /tmp/router-diag-log-assessed
+            return 0
             ;;
         *)
-            log_msg "Unknown action in response: $action (not applied)"
+            log_msg "Unknown action: $action (not applied)"
+            return 1
             ;;
     esac
-
-    echo "---" >> "$ANALYSIS_LOG"
-    echo "" >> "$ANALYSIS_LOG"
 }
 
 cmd_analyze() {
@@ -1522,17 +1919,17 @@ cmd_history() {
     echo "=== Recent Metrics (last $count entries) ==="
     echo ""
 
-    if [ ! -f "$METRICS_FILE" ]; then
+    if [ ! -f "$METRICS_PATH" ]; then
         echo "No metrics data. Start the daemon first."
         return
     fi
 
     # Print header
-    head -1 "$METRICS_FILE"
+    head -1 "$METRICS_PATH"
     echo "---"
 
     # Print last N entries
-    tail -"$count" "$METRICS_FILE"
+    tail -"$count" "$METRICS_PATH"
 }
 
 cmd_log() {
@@ -1573,7 +1970,7 @@ cmd_log() {
 rotate_metrics() {
     # Size-based rotation: cap metrics.csv and analysis.log at MAX_FILE_SIZE (default 2GB)
     local file size
-    for file in "$METRICS_FILE" "$ANALYSIS_LOG"; do
+    for file in "$METRICS_PATH" "$ANALYSIS_LOG"; do
         [ -f "$file" ] || continue
         size=$(wc -c < "$file")
         if [ "$size" -gt "$MAX_FILE_SIZE" ]; then
@@ -1924,7 +2321,7 @@ check_network_health() {
 
     # WAN interface — report only, NEVER restart (QMI modem safety)
     local wan_status
-    wan_status=$(ifstatus wan 2>/dev/null)
+    wan_status=$(ifstatus ${MODEM_IFACE} 2>/dev/null)
     if ! echo "$wan_status" | grep -q '"up": true'; then
         failed_services="${failed_services}wan,"
         critical_fail=1
@@ -2546,12 +2943,41 @@ daemon_loop() {
         local now
         now=$(epoch)
 
+        # --- Stability Watch: Restore Preferred Setup ---
+        if [ "$HEALTH_STATUS" = "OK" ] && [ "$collect_count" -gt "$warmup_cycles" ]; then
+            if [ -n "$PREFERRED_BANDS" ] || [ -n "$PREFERRED_CELL" ]; then
+                # Only check if we are NOT currently on the preferred setup
+                local current_bands restore_needed=0
+                current_bands=$(collect_bands)
+                
+                # Simple check for preferred bands in current bands string
+                if [ -n "$PREFERRED_BANDS" ] && ! echo "$current_bands" | grep -q "$PREFERRED_BANDS"; then
+                    restore_needed=1
+                fi
+                
+                if [ "$restore_needed" -eq 1 ]; then
+                    log_msg "STABILITY: System is stable. Restoring preferred setup..."
+                    [ -n "$PREFERRED_BANDS" ] && modemband.sh setbands "$PREFERRED_BANDS" >/dev/null 2>&1
+                    [ -n "$PREFERRED_CELL" ] && $SMS_TOOL -d "$AT_PORT" at "AT+ZLOCKCELL=$PREFERRED_CELL" >/dev/null 2>&1
+                    log_msg "STABILITY: Preferred setup restored ($PREFERRED_BANDS / $PREFERRED_CELL)"
+                fi
+            fi
+        fi
+
         # 1. Collect metrics
         local metrics
         metrics=$(collect_all_metrics)
 
         if [ -n "$metrics" ]; then
-            echo "$metrics" >> "$METRICS_FILE"
+            if [ "$FLASH_SAFE_MODE" = "1" ]; then
+                echo "$metrics" >> "$ACTIVE_METRICS_FILE"
+                # Distill to flash every SYNC_INTERVAL_RECORDS
+                if [ $((collect_count % SYNC_INTERVAL_RECORDS)) -eq 0 ] && [ "$collect_count" -gt 0 ]; then
+                    distill_metrics "$ACTIVE_METRICS_FILE"
+                fi
+            else
+                echo "$metrics" >> "$METRICS_PATH"
+            fi
             collect_count=$((collect_count + 1))
         fi
 

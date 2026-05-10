@@ -28,6 +28,7 @@ var CSS = '\
 .rd-sensor-table { width: 100%; border-collapse: collapse; margin-top: 1em; } \
 .rd-sensor-table th, .rd-sensor-table td { padding: 0.5em; border-bottom: 1px solid var(--border-color-medium, #eee); text-align: left; } \
 .rd-sensor-table input[type="text"], .rd-sensor-table input[type="number"] { width: 100%; box-sizing: border-box; } \
+.rd-chart-container { height: 250px; margin-top: 1em; } \
 ';
 
 function badge(status) {
@@ -71,6 +72,11 @@ function fetchData() {
 
 return view.extend({
 	load: function() {
+		// Load Chart.js dynamically
+		var script = document.createElement('script');
+		script.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+		document.head.appendChild(script);
+
 		return fetchData();
 	},
 
@@ -118,6 +124,8 @@ return view.extend({
 		kv(_('RSRP'), m.rsrp ? m.rsrp + ' dBm' : '-').forEach(function(n) { grid.appendChild(n); });
 		kv(_('RSRQ'), m.rsrq ? m.rsrq + ' dB' : '-').forEach(function(n) { grid.appendChild(n); });
 		kv(_('SNR'), m.snr ? m.snr + ' dB' : '-').forEach(function(n) { grid.appendChild(n); });
+		kv(_('Bands'), m.bands || '-').forEach(function(n) { grid.appendChild(n); });
+		kv(_('Weather'), m.weather ? m.weather.replace(/\|/g, ', ') : '-').forEach(function(n) { grid.appendChild(n); });
 		kv(_('Latency'), m.latency_ms ? m.latency_ms + ' ms' : '-').forEach(function(n) { grid.appendChild(n); });
 		kv(_('Load (1m)'), m.load_1m || '-').forEach(function(n) { grid.appendChild(n); });
 		kv(_('Free Memory'), m.mem_free_kb ? m.mem_free_kb + ' KB' : '-').forEach(function(n) { grid.appendChild(n); });
@@ -140,6 +148,93 @@ return view.extend({
 		}
 
 		card.appendChild(grid);
+		return card;
+	},
+
+	renderTrends: function(data) {
+		var card = E('div', { 'class': 'rd-card', 'style': 'grid-column: span 2' });
+		card.appendChild(E('h3', {}, _('Historical Trends')));
+
+		if (!data.history || data.history.length === 0) {
+			card.appendChild(E('p', { 'style': 'color:var(--color-text-secondary,#999)' }, _('Insufficient data for charts.')));
+			return card;
+		}
+
+		var chartGrid = E('div', { 'class': 'rd-grid' });
+		
+		var signalContainer = E('div', { 'class': 'rd-chart-container' });
+		var signalCanvas = E('canvas', { 'id': 'signalChart' });
+		signalContainer.appendChild(signalCanvas);
+		chartGrid.appendChild(signalContainer);
+
+		var systemContainer = E('div', { 'class': 'rd-chart-container' });
+		var systemCanvas = E('canvas', { 'id': 'systemChart' });
+		systemContainer.appendChild(systemCanvas);
+		chartGrid.appendChild(systemContainer);
+
+		card.appendChild(chartGrid);
+
+		// Wait for Chart.js and DOM
+		window.setTimeout(function() {
+			if (typeof Chart === 'undefined') return;
+
+			var labels = data.history.map(function(d) { return d[0].split(' ')[1]; }); // HH:MM:SS
+			
+			// Signal Chart
+			new Chart(signalCanvas, {
+				type: 'line',
+				data: {
+					labels: labels,
+					datasets: [
+						{
+							label: 'RSRP (dBm)',
+							data: data.history.map(function(d) { return d[1]; }),
+							borderColor: '#28a745',
+							yAxisID: 'y'
+						},
+						{
+							label: 'SNR (dB)',
+							data: data.history.map(function(d) { return d[4]; }),
+							borderColor: '#007bff',
+							yAxisID: 'y1'
+						}
+					]
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false,
+					scales: {
+						y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'RSRP' } },
+						y1: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'SNR' }, grid: { drawOnChartArea: false } }
+					}
+				}
+			});
+
+			// System Chart
+			new Chart(systemCanvas, {
+				type: 'line',
+				data: {
+					labels: labels,
+					datasets: [
+						{
+							label: 'Temp (°C)',
+							data: data.history.map(function(d) { return d[10]; }),
+							borderColor: '#dc3545'
+						},
+						{
+							label: 'Load',
+							data: data.history.map(function(d) { return d[8]; }),
+							borderColor: '#ffc107'
+						}
+					]
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false
+				}
+			});
+		}, 1000);
+
 		return card;
 	},
 
@@ -204,16 +299,48 @@ return view.extend({
 
 	renderConfig: function(data) {
 		var card = E('div', { 'class': 'rd-card' });
-		card.appendChild(E('h3', {}, _('General Configuration')));
+		card.appendChild(E('h3', {}, _('Identity & Environment')));
 
 		var cfg = data.config || {};
+		var identFields = [
+			{ key: 'model_name',   configKey: 'model_name',   label: _('Router Model'),          type: 'text' },
+			{ key: 'site_type',    configKey: 'site_type',    label: _('Site Environment'),      type: 'text' },
+			{ key: 'rsrp_base',    configKey: 'rsrp_base',    label: _('Baseline RSRP (dBm)'),   type: 'number' },
+			{ key: 'snr_base',     configKey: 'snr_base',     label: _('Baseline SNR (dB)'),     type: 'number' },
+			{ key: 'services',     configKey: 'services',     label: _('Authorized Services'),   type: 'text' },
+			{ key: 'modem_iface',  configKey: 'modem_iface',  label: _('Modem Interface (UCI)'), type: 'text' },
+			{ key: 'pref_bands',   configKey: 'pref_bands',   label: _('Preferred Bands'),       type: 'text' },
+			{ key: 'pref_cell',    configKey: 'pref_cell',    label: _('Preferred Cell (E,P)'),  type: 'text' },
+			{ key: 'reboot_timeout', configKey: 'reboot_timeout', label: _('Reboot Timeout (mins)'), type: 'number' }
+		];
+
+		var container = E('div', {});
+		identFields.forEach(function(f) {
+			var row = E('div', { 'class': 'rd-config-row' });
+			row.appendChild(E('label', {}, f.label));
+			var val = cfg[f.configKey] || '';
+			row.appendChild(E('input', { type: 'text', value: val, 'data-key': f.key, 'data-orig': val }));
+			container.appendChild(row);
+		});
+
+		card.appendChild(container);
+		card.appendChild(E('h3', { 'style': 'margin-top: 1.5em' }, _('General Configuration')));
+
 		var fields = [
 			{ key: 'latency',         configKey: 'latency_threshold', label: _('Latency Threshold (ms)'),  type: 'number' },
 			{ key: 'hourly',          configKey: 'hourly_check',      label: _('Hourly Check'),            type: 'toggle' },
 			{ key: 'cooldown',        configKey: 'api_cooldown',      label: _('API Cooldown (seconds)'),  type: 'number' },
 			{ key: 'email_enabled',   configKey: 'email_enabled',     label: _('Email Notifications'),     type: 'toggle' },
 			{ key: 'email_to',        configKey: 'email_to',          label: _('Email Address'),           type: 'text' },
-			{ key: 'interval',        configKey: 'collect_interval',  label: _('Collect Interval (sec)'),  type: 'number' }
+			{ key: 'interval',        configKey: 'collect_interval',  label: _('Collect Interval (sec)'),  type: 'number' },
+			{ key: 'metrics_path',    configKey: 'metrics_path',      label: _('CSV Save Path'),           type: 'text' },
+			{ key: 'metrics_max_size', configKey: 'metrics_max_size', label: _('Max CSV Size (MB)'),       type: 'number' },
+			{ key: 'weather_api_key', configKey: 'weather_api_key',   label: _('OpenWeather API Key'),     type: 'text' },
+			{ key: 'lat',             configKey: 'lat',               label: _('Latitude'),                type: 'text' },
+			{ key: 'lon',             configKey: 'lon',               label: _('Longitude'),               type: 'text' },
+			{ key: 'self_heal',       configKey: 'self_heal',         label: _('Self-Healing Registry'),   type: 'toggle' },
+			{ key: 'flash_safe',      configKey: 'flash_safe',        label: _('Flash-Safe Mode (RAM+AI)'),type: 'toggle' },
+			{ key: 'sync_records',    configKey: 'sync_records',      label: _('AI Distillation Every (N)'),type: 'number' }
 		];
 
 		var container = E('div', {});
@@ -403,14 +530,20 @@ return view.extend({
 	renderContent: function(data) {
 		var frag = document.createDocumentFragment();
 		frag.appendChild(this.renderActions());
+		
 		var topGrid = E('div', { 'class': 'rd-grid' });
 		topGrid.appendChild(this.renderOverview(data));
 		topGrid.appendChild(this.renderSignal(data));
 		frag.appendChild(topGrid);
+
+		// Trends charts
+		frag.appendChild(this.renderTrends(data));
+
 		var bottomGrid = E('div', { 'class': 'rd-grid' });
 		bottomGrid.appendChild(this.renderHealth(data));
 		bottomGrid.appendChild(this.renderAnalysis(data));
 		frag.appendChild(bottomGrid);
+		
 		frag.appendChild(this.renderConfig(data));
 		return frag;
 	},
