@@ -1,0 +1,2842 @@
+#!/bin/sh
+# ==========================================================
+# router-diag — AI-Powered Router Diagnostics for MF286D
+# ==========================================================
+# Continuously monitors LTE signal, network performance, and
+# system health. Uses Google Gemini AI to diagnose issues and
+# recommend optimizations.
+#
+# Usage: router-diag {setup|start|stop|status|analyze|history|log|config}
+# ==========================================================
+
+VERSION="0.9.2a"
+PROG="router-diag"
+
+# --- Paths ---
+USB_MOUNT="/mnt/usb"
+USB_DEVICE=""
+DIAG_DIR="$USB_MOUNT/router-diag"
+CONFIG_FILE="$DIAG_DIR/config.conf"
+METRICS_FILE="$DIAG_DIR/metrics.csv"
+ANALYSIS_LOG="$DIAG_DIR/analysis.log"
+HISTORY_DIR="$DIAG_DIR/history"
+PID_FILE="/var/run/router-diag.pid"
+LOCK_FILE="/var/run/router-diag.lock"
+
+# --- Defaults (overridden by config) ---
+GEMINI_API_KEY=""
+GEMINI_MODEL="gemini-2.5-flash"
+COLLECT_INTERVAL=120        # 2 minutes
+TRIGGER_RSRP=-110           # dBm
+TRIGGER_LATENCY=100         # ms
+TRIGGER_CA_DROP=1            # 1=enabled
+TRIGGER_HOURLY=1             # 1=enabled
+API_COOLDOWN=600             # 10 minutes between API calls
+EMAIL_TO="stevemeek82@gmail.com"
+EMAIL_FROM="stevemeek82@gmail.com"
+EMAIL_APP_PASSWORD=""
+EMAIL_ENABLED=1
+MAX_FILE_SIZE=2147483648  # 2GB per file
+TEMP_WARNING=85             # Default if no per-sensor config
+TEMP_CRITICAL=95            # Default if no per-sensor config
+MEM_LOW_KB=20480
+LOAD_HIGH=1.0
+
+# Dynamic Sensors: Space-separated list of "path|label|warning|critical|enabled"
+# Example: "/sys/class/thermal/thermal_zone1/temp|CPU|85|100|1"
+SENSORS=""
+
+# --- Modem ---
+AT_PORT="/dev/ttyUSB2"
+SMS_TOOL="sms_tool"
+
+# ==========================================================
+# Utility Functions
+# ==========================================================
+
+log_msg() {
+    logger -t "$PROG" "$1"
+    echo "[$PROG] $1"
+}
+
+log_err() {
+    logger -t "$PROG" -p user.err "$1"
+    echo "[$PROG] ERROR: $1" >&2
+}
+
+die() {
+    log_err "$1"
+    exit 1
+}
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+epoch() {
+    date '+%s'
+}
+
+# Send AT command via sms_tool
+at_cmd() {
+    local cmd="$1"
+    $SMS_TOOL -d "$AT_PORT" at "$cmd" 2>/dev/null
+}
+
+# ==========================================================
+# Email Notifications
+# ==========================================================
+
+send_email() {
+    local subject="$1" body="$2"
+
+    [ "$EMAIL_ENABLED" = "1" ] || return 0
+
+    log_msg "Sending email: $subject"
+
+    printf "To: %s\nSubject: %s\n\n%b" \
+        "$EMAIL_TO" "$subject" "$body" | \
+    msmtp "$EMAIL_TO" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        log_msg "Email sent successfully"
+    else
+        log_err "Failed to send email"
+        return 1
+    fi
+}
+
+# ==========================================================
+# Config Management
+# ==========================================================
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    . "$CONFIG_FILE"
+    return 0
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" << CONF
+# RouterDiag configuration
+# Generated: $(timestamp)
+
+GEMINI_API_KEY="$GEMINI_API_KEY"
+GEMINI_MODEL="$GEMINI_MODEL"
+COLLECT_INTERVAL=$COLLECT_INTERVAL
+TRIGGER_RSRP=$TRIGGER_RSRP
+TRIGGER_LATENCY=$TRIGGER_LATENCY
+TRIGGER_CA_DROP=$TRIGGER_CA_DROP
+TRIGGER_HOURLY=$TRIGGER_HOURLY
+API_COOLDOWN=$API_COOLDOWN
+EMAIL_TO="$EMAIL_TO"
+EMAIL_FROM="$EMAIL_FROM"
+EMAIL_APP_PASSWORD="$EMAIL_APP_PASSWORD"
+EMAIL_ENABLED=$EMAIL_ENABLED
+MAX_FILE_SIZE=$MAX_FILE_SIZE
+TEMP_WARNING=$TEMP_WARNING
+TEMP_CRITICAL=$TEMP_CRITICAL
+MEM_LOW_KB=$MEM_LOW_KB
+LOAD_HIGH=$LOAD_HIGH
+SENSORS="$SENSORS"
+CONF
+    chmod 600 "$CONFIG_FILE"
+
+    # Keep msmtprc in sync
+    [ -n "$EMAIL_APP_PASSWORD" ] && _write_msmtprc
+}
+
+_write_msmtprc() {
+    cat > /etc/msmtprc << MSMTP
+account default
+host smtp.gmail.com
+port 587
+tls on
+tls_starttls on
+auth on
+user $EMAIL_FROM
+password $EMAIL_APP_PASSWORD
+from $EMAIL_FROM
+MSMTP
+    chmod 600 /etc/msmtprc
+}
+
+show_config() {
+    echo "=== router-diag configuration ==="
+    echo ""
+    echo "Gemini API Key:    ${GEMINI_API_KEY:+[set]}${GEMINI_API_KEY:-[not set]}"
+    echo "Gemini Model:      $GEMINI_MODEL"
+    echo "Collect Interval:  ${COLLECT_INTERVAL}s"
+    echo "API Cooldown:      ${API_COOLDOWN}s"
+    echo ""
+    echo "--- Email Notifications ---"
+    echo "Email Enabled:     $([ "$EMAIL_ENABLED" = "1" ] && echo "yes" || echo "no")"
+    echo "Email To:          $EMAIL_TO"
+    echo "Email From:        $EMAIL_FROM"
+    echo "App Password:      ${EMAIL_APP_PASSWORD:+[set]}${EMAIL_APP_PASSWORD:-[not set]}"
+    echo ""
+    echo "--- Trigger Thresholds ---"
+    echo "RSRP:              $TRIGGER_RSRP dBm"
+    echo "Latency:           $TRIGGER_LATENCY ms"
+    echo "CA Drop Detection: $([ "$TRIGGER_CA_DROP" = "1" ] && echo "enabled" || echo "disabled")"
+    echo "Hourly Check:      $([ "$TRIGGER_HOURLY" = "1" ] && echo "enabled" || echo "disabled")"
+    echo ""
+    echo "--- Retention ---"
+    echo "Max file size:     $((MAX_FILE_SIZE / 1048576))MB"
+    echo ""
+    echo "--- System Health Thresholds ---"
+    echo "Temp Warning:      ${TEMP_WARNING}C"
+    echo "Temp Critical:     ${TEMP_CRITICAL}C"
+    echo "Memory Low:        ${MEM_LOW_KB}KB"
+    echo "Load High:         $LOAD_HIGH"
+    echo ""
+    echo "--- Autonomous Behaviour ---"
+    echo "Band changes:      Auto-applied"
+    echo "Network health:    Auto-fix (max 2 restarts/hr per service)"
+    echo "Cell locks:        Email notification only"
+    echo "Modem restarts:    Email notification only"
+    echo ""
+    echo "Config file: $CONFIG_FILE"
+}
+
+cmd_config() {
+    load_config || die "No config found. Run '$PROG setup' first."
+
+    if [ -z "$1" ]; then
+        show_config
+        return
+    fi
+
+    local key="$1"
+    local val="$2"
+
+    if [ -z "$val" ]; then
+        # Show single value
+        case "$key" in
+            api_key)           echo "$GEMINI_API_KEY" ;;
+            model)             echo "$GEMINI_MODEL" ;;
+            interval)          echo "$COLLECT_INTERVAL" ;;
+            rsrp)              echo "$TRIGGER_RSRP" ;;
+            latency)           echo "$TRIGGER_LATENCY" ;;
+            ca_drop)           echo "$TRIGGER_CA_DROP" ;;
+            hourly)            echo "$TRIGGER_HOURLY" ;;
+            cooldown)          echo "$API_COOLDOWN" ;;
+            email_to)          echo "$EMAIL_TO" ;;
+            email_from)        echo "$EMAIL_FROM" ;;
+            email_app_password) echo "${EMAIL_APP_PASSWORD:+[set]}${EMAIL_APP_PASSWORD:-[not set]}" ;;
+            email_enabled)     echo "$EMAIL_ENABLED" ;;
+            temp_warning)      echo "$TEMP_WARNING" ;;
+            temp_critical)     echo "$TEMP_CRITICAL" ;;
+            mem_low)           echo "$MEM_LOW_KB" ;;
+            load_high)         echo "$LOAD_HIGH" ;;
+            *)                 echo "Unknown key: $key" >&2; return 1 ;;
+        esac
+        return
+    fi
+
+    # Set value
+    case "$key" in
+        api_key)           GEMINI_API_KEY="$val" ;;
+        model)             GEMINI_MODEL="$val" ;;
+        interval)          COLLECT_INTERVAL="$val" ;;
+        rsrp)              TRIGGER_RSRP="$val" ;;
+        latency)           TRIGGER_LATENCY="$val" ;;
+        ca_drop)           TRIGGER_CA_DROP="$val" ;;
+        hourly)            TRIGGER_HOURLY="$val" ;;
+        cooldown)          API_COOLDOWN="$val" ;;
+        email_to)          EMAIL_TO="$val" ;;
+        email_from)        EMAIL_FROM="$val" ;;
+        email_app_password) EMAIL_APP_PASSWORD="$val" ;;
+        sensors)           SENSORS="$val" ;;
+        email_enabled)
+            case "$val" in
+                0|1) EMAIL_ENABLED="$val" ;;
+                *) die "email_enabled must be 0 or 1" ;;
+            esac
+            ;;
+        temp_warning)
+            case "$val" in ''|*[!0-9]*) die "temp_warning must be a positive integer (degrees C)" ;; esac
+            TEMP_WARNING="$val"
+            ;;
+        temp_critical)
+            case "$val" in ''|*[!0-9]*) die "temp_critical must be a positive integer (degrees C)" ;; esac
+            TEMP_CRITICAL="$val"
+            ;;
+        mem_low)
+            case "$val" in ''|*[!0-9]*) die "mem_low must be a positive integer (KB)" ;; esac
+            MEM_LOW_KB="$val"
+            ;;
+        load_high)         LOAD_HIGH="$val" ;;
+        *)                 die "Unknown key: $key" ;;
+    esac
+
+    save_config
+    log_msg "Config updated: $key=$val"
+}
+
+# ==========================================================
+# USB Setup
+# ==========================================================
+
+find_usb_device() {
+    # Look for USB storage block devices
+    local dev
+    for dev in /dev/sd[a-z] /dev/sd[a-z][0-9]; do
+        [ -b "$dev" ] || continue
+        # Check if it's USB
+        local sys_path=""
+        case "$dev" in
+            /dev/sd[a-z])
+                sys_path="/sys/block/$(basename "$dev")"
+                ;;
+            /dev/sd[a-z][0-9])
+                local disk="${dev%[0-9]}"
+                sys_path="/sys/block/$(basename "$disk")"
+                ;;
+        esac
+        if [ -n "$sys_path" ] && readlink -f "$sys_path" 2>/dev/null | grep -q "usb"; then
+            # Prefer partition over raw disk
+            if [ -b "${dev}1" ]; then
+                echo "${dev}1"
+            else
+                echo "$dev"
+            fi
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_usb_mounted() {
+    mount | grep -q "$USB_MOUNT"
+}
+
+mount_usb() {
+    if is_usb_mounted; then
+        return 0
+    fi
+
+    mkdir -p "$USB_MOUNT"
+
+    USB_DEVICE=$(find_usb_device) || {
+        log_err "No USB storage device found"
+        return 1
+    }
+
+    # Try mounting
+    mount "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
+    mount -t ext4 "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
+    mount -t vfat "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
+
+    log_err "Could not mount $USB_DEVICE at $USB_MOUNT"
+    return 1
+}
+
+format_usb() {
+    local dev="$1"
+    echo ""
+    echo "WARNING: This will ERASE ALL DATA on $dev"
+    echo -n "Continue? (yes/no): "
+    read confirm
+    [ "$confirm" = "yes" ] || { echo "Aborted."; return 1; }
+
+    # Unmount if mounted
+    umount "$USB_MOUNT" 2>/dev/null
+    umount "$dev" 2>/dev/null
+
+    log_msg "Formatting $dev as ext4..."
+
+    # If it's a raw disk (no partition number), create a partition first
+    case "$dev" in
+        /dev/sd[a-z])
+            echo -e "o\nn\np\n1\n\n\nw" | fdisk "$dev" 2>/dev/null
+            sleep 2
+            dev="${dev}1"
+            ;;
+    esac
+
+    mkfs.ext4 -L "router-diag" "$dev" || {
+        log_err "Failed to format $dev"
+        return 1
+    }
+
+    mkdir -p "$USB_MOUNT"
+    mount "$dev" "$USB_MOUNT" || {
+        log_err "Failed to mount after formatting"
+        return 1
+    }
+
+    log_msg "USB formatted and mounted at $USB_MOUNT"
+    return 0
+}
+
+add_fstab_entry() {
+    local dev="$1"
+    local uuid
+
+    # Get UUID
+    uuid=$(block info "$dev" 2>/dev/null | sed -n 's/.*UUID="\([^"]*\)".*/\1/p')
+
+    if [ -z "$uuid" ]; then
+        log_err "Could not determine UUID for $dev, skipping fstab"
+        return 1
+    fi
+
+    # Check if already in fstab (OpenWRT uses UCI)
+    if uci show fstab 2>/dev/null | grep -q "$uuid"; then
+        log_msg "Fstab entry already exists for $uuid"
+        return 0
+    fi
+
+    # Add via UCI
+    local cfg
+    cfg=$(uci add fstab mount)
+    uci set "fstab.$cfg.target=$USB_MOUNT"
+    uci set "fstab.$cfg.uuid=$uuid"
+    uci set "fstab.$cfg.enabled=1"
+    uci set "fstab.$cfg.fstype=ext4"
+    uci set "fstab.$cfg.options=rw,noatime"
+    uci commit fstab
+
+    # Enable fstab service
+    /etc/init.d/fstab enable 2>/dev/null
+
+    log_msg "Added fstab entry for UUID=$uuid -> $USB_MOUNT"
+    return 0
+}
+
+# ==========================================================
+# Setup Wizard
+# ==========================================================
+
+cmd_setup() {
+    echo "=== router-diag Setup ==="
+    echo ""
+
+    # Step 1: USB
+    echo "--- Step 1: USB Storage ---"
+    USB_DEVICE=$(find_usb_device)
+
+    if [ -z "$USB_DEVICE" ]; then
+        die "No USB storage device found. Please insert a USB stick."
+    fi
+
+    echo "Found USB device: $USB_DEVICE"
+
+    if is_usb_mounted; then
+        echo "USB already mounted at $USB_MOUNT"
+    else
+        # Check if already has a filesystem
+        if block info "$USB_DEVICE" 2>/dev/null | grep -q "TYPE="; then
+            echo "USB has existing filesystem."
+            echo -n "Mount existing (m) or format fresh (f)? [m]: "
+            read choice
+            case "$choice" in
+                f|F) format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed" ;;
+                *)   mount_usb || die "Mount failed" ;;
+            esac
+        else
+            echo "USB has no filesystem. Formatting..."
+            format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed"
+        fi
+    fi
+
+    # Add fstab entry for auto-mount
+    add_fstab_entry "$USB_DEVICE"
+
+    # Create directory structure
+    mkdir -p "$DIAG_DIR" "$HISTORY_DIR"
+
+    # Step 2: Gemini API Key
+    echo ""
+    echo "--- Step 2: Gemini API Key ---"
+    echo "Get a free API key at: https://aistudio.google.com/apikey"
+    echo ""
+
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        if [ -n "$GEMINI_API_KEY" ]; then
+            echo "Existing API key found."
+            echo -n "Keep existing key? (y/n) [y]: "
+            read keep
+            [ "$keep" = "n" ] || [ "$keep" = "N" ] || {
+                echo "Keeping existing key."
+                _setup_finish
+                return
+            }
+        fi
+    fi
+
+    echo -n "Enter Gemini API key: "
+    read GEMINI_API_KEY
+    [ -n "$GEMINI_API_KEY" ] || die "API key is required"
+
+    # Validate key with a test request
+    echo "Validating API key..."
+    local test_response
+    test_response=$(curl -s -w "\n%{http_code}" \
+        "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
+        -H 'Content-Type: application/json' \
+        -H "x-goog-api-key: $GEMINI_API_KEY" \
+        -d '{"contents":[{"parts":[{"text":"Reply with just: OK"}]}]}' 2>/dev/null)
+
+    local http_code
+    http_code=$(echo "$test_response" | tail -1)
+
+    if [ "$http_code" != "200" ]; then
+        echo "WARNING: API key validation returned HTTP $http_code"
+        echo -n "Continue anyway? (y/n) [n]: "
+        read cont
+        [ "$cont" = "y" ] || [ "$cont" = "Y" ] || die "Aborted"
+    else
+        echo "API key validated successfully!"
+    fi
+
+    _setup_email
+}
+
+_setup_email() {
+    # Step 3: Email notifications
+    echo ""
+    echo "--- Step 3: Email Notifications ---"
+    echo ""
+    echo "Router-diag sends email alerts for issues needing manual action"
+    echo "(cell locks, modem restarts, critical status)."
+    echo ""
+    echo "This uses Gmail SMTP. You need a Gmail App Password:"
+    echo "  1. Go to https://myaccount.google.com/apppasswords"
+    echo "  2. Select 'Mail' and your device"
+    echo "  3. Copy the 16-character password"
+    echo ""
+
+    if [ -n "$EMAIL_APP_PASSWORD" ]; then
+        echo "Existing email config found (to: $EMAIL_TO)."
+        echo -n "Keep existing email config? (y/n) [y]: "
+        read keep_email
+        [ "$keep_email" = "n" ] || [ "$keep_email" = "N" ] || {
+            echo "Keeping existing email config."
+            _setup_finish
+            return
+        }
+    fi
+
+    echo -n "Gmail App Password (or 'skip' to disable email): "
+    read input_password
+
+    if [ "$input_password" = "skip" ]; then
+        EMAIL_ENABLED=0
+        echo "Email notifications disabled. Enable later with:"
+        echo "  $PROG config email_app_password <password>"
+        echo "  $PROG config email_enabled 1"
+    else
+        EMAIL_APP_PASSWORD="$input_password"
+        EMAIL_ENABLED=1
+
+        echo -n "Send to [$EMAIL_TO]: "
+        read input_to
+        [ -n "$input_to" ] && EMAIL_TO="$input_to"
+
+        # Write msmtp config
+        _write_msmtprc
+
+        # Send test email
+        echo ""
+        echo "Sending test email to $EMAIL_TO..."
+
+        printf "To: %s\nSubject: %s\n\n%s" \
+            "$EMAIL_TO" "[router-diag] Test — setup complete" \
+            "This is a test email from router-diag. If you received this, email notifications are working." | \
+        msmtp "$EMAIL_TO" 2>/dev/null
+
+        if [ $? -eq 0 ]; then
+            echo "Test email sent! Check your inbox."
+        else
+            echo "WARNING: Test email failed. Check your app password."
+            echo -n "Continue anyway? (y/n) [y]: "
+            read cont_email
+            [ "$cont_email" = "n" ] && {
+                EMAIL_ENABLED=0
+                echo "Email disabled. Fix and enable later via config."
+            }
+        fi
+    fi
+
+    _setup_finish
+}
+
+_setup_finish() {
+    # Step 4: Save config
+    echo ""
+    echo "--- Step 4: Configuration ---"
+    save_config
+
+    # Initialize metrics CSV with header
+    if [ ! -f "$METRICS_FILE" ]; then
+        echo "timestamp,rsrp,rsrq,rssi,snr,latency_ms,dl_bytes,ul_bytes,load_1m,mem_free_kb,temp1,temp2" > "$METRICS_FILE"
+    fi
+
+    # Initialize analysis log
+    if [ ! -f "$ANALYSIS_LOG" ]; then
+        echo "# router-diag analysis log" > "$ANALYSIS_LOG"
+        echo "# Created: $(timestamp)" >> "$ANALYSIS_LOG"
+        echo "" >> "$ANALYSIS_LOG"
+    fi
+
+    echo ""
+    echo "=== Setup Complete ==="
+    echo ""
+    echo "Start the daemon:    $PROG start"
+    echo "Run manual analysis: $PROG analyze"
+    echo "View current status: $PROG status"
+    echo "Adjust settings:     $PROG config <key> <value>"
+    echo ""
+    echo "Configuration saved to: $CONFIG_FILE"
+}
+
+# ==========================================================
+# Metric Collectors
+# ==========================================================
+
+collect_signal() {
+    # Returns: rsrp rsrq rssi snr
+    # AT+ZRSSI returns: +ZRSSI: rsrp,rsrq,rssi,snr (e.g., +ZRSSI: -96,-8,-71,19.2)
+    local raw
+    raw=$(at_cmd 'AT+ZRSSI')
+
+    local values
+    values=$(echo "$raw" | grep '+ZRSSI:' | sed 's/.*+ZRSSI:[[:space:]]*//' | tr -d ' \r')
+
+    local rsrp rsrq rssi snr
+    rsrp=$(echo "$values" | cut -d',' -f1)
+    rsrq=$(echo "$values" | cut -d',' -f2)
+    rssi=$(echo "$values" | cut -d',' -f3)
+    snr=$(echo "$values" | cut -d',' -f4)
+
+    echo "${rsrp:-0} ${rsrq:-0} ${rssi:-0} ${snr:-0}"
+}
+
+collect_latency() {
+    # Returns: latency in ms (average of 3 pings)
+    # Tries 1.1.1.1 first, falls back to 8.8.8.8 if unreachable
+    local ping_out result target
+    for target in 1.1.1.1 8.8.8.8; do
+        ping_out=$(ping -c 3 -W 2 "$target" 2>/dev/null)
+        # Extract avg: second field after = and split by /
+        result=$(echo "$ping_out" | grep -E '(round-trip|rtt)' | \
+            sed 's/.*= *//' | cut -d'/' -f2)
+        if [ -n "$result" ]; then
+            printf "%.0f" "$result" 2>/dev/null || echo "$result"
+            return
+        fi
+    done
+    echo "9999"
+}
+
+collect_throughput() {
+    # Returns: dl_bytes ul_bytes (delta since last call)
+    # Uses /proc/net/dev for the WAN interface (wwan0 typically)
+    local iface="wwan0"
+    local stats
+    stats=$(grep "$iface" /proc/net/dev 2>/dev/null | tr -s ' ')
+
+    if [ -z "$stats" ]; then
+        echo "0 0"
+        return
+    fi
+
+    local rx_bytes tx_bytes
+    rx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $3}')
+    tx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $11}')
+
+    # Guard: ensure integer values (empty/malformed → 0)
+    case "$rx_bytes" in ''|*[!0-9]*) rx_bytes=0 ;; esac
+    case "$tx_bytes" in ''|*[!0-9]*) tx_bytes=0 ;; esac
+
+    # Store in temp file for delta calculation
+    local prev_file="/tmp/router-diag-throughput"
+    if [ -f "$prev_file" ]; then
+        local prev_rx prev_tx prev_time
+        read prev_rx prev_tx prev_time < "$prev_file"
+        local now_time
+        now_time=$(epoch)
+        local delta_t=$((now_time - prev_time))
+        if [ "$delta_t" -gt 0 ]; then
+            local dl=$((rx_bytes - prev_rx))
+            local ul=$((tx_bytes - prev_tx))
+            # Handle counter wrap
+            [ "$dl" -lt 0 ] && dl=0
+            [ "$ul" -lt 0 ] && ul=0
+            echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
+            echo "$dl $ul"
+            return
+        fi
+    fi
+
+    echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
+    echo "0 0"
+}
+
+collect_system() {
+    # Returns: load_1m mem_free_kb sensor1_val sensor2_val ...
+    local load_1m
+    load_1m=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+
+    local mem_free
+    mem_free=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+    [ -z "$mem_free" ] && mem_free=$(awk '/MemFree:/ {print $2}' /proc/meminfo 2>/dev/null)
+
+    local sensor_vals=""
+    if [ -n "$SENSORS" ]; then
+        local s
+        for s in $SENSORS; do
+            local path label warn crit enabled
+            IFS='|' read -r path label warn crit enabled << SENSOR
+$s
+SENSOR
+            if [ "$enabled" = "1" ]; then
+                local t="0"
+                if [ -f "$path" ]; then
+                    t=$(cat "$path" 2>/dev/null)
+                    [ -n "$t" ] && [ "$t" -gt 0 ] || t="0"
+                    [ "$t" -gt 1000 ] && t=$((t / 1000))
+                fi
+                sensor_vals="$sensor_vals $t"
+            fi
+        done
+    else
+        # Fallback to legacy detection if no config exists
+        local t sensor_idx=0
+        for tf in /sys/class/hwmon/hwmon*/temp*_input /sys/class/thermal/thermal_zone*/temp; do
+            [ -f "$tf" ] || continue
+            t=$(cat "$tf" 2>/dev/null)
+            [ -n "$t" ] && [ "$t" -gt 0 ] || continue
+            [ "$t" -gt 1000 ] && t=$((t / 1000))
+            sensor_idx=$((sensor_idx + 1))
+            sensor_vals="$sensor_vals $t"
+            [ "$sensor_idx" -ge 4 ] && break
+        done
+    fi
+
+    echo "${load_1m:-0} ${mem_free:-0} ${sensor_vals:-0 0}"
+}
+
+collect_all_metrics() {
+    # Collect everything and return as CSV line
+    local sig lat tp sys
+    sig=$(collect_signal)
+    lat=$(collect_latency)
+    tp=$(collect_throughput)
+    sys=$(collect_system)
+
+    local rsrp rsrq rssi snr
+    set -- $sig; rsrp="$1"; rsrq="$2"; rssi="$3"; snr="$4"
+
+    local dl_bytes ul_bytes
+    set -- $tp; dl_bytes="$1"; ul_bytes="$2"
+
+    local load_1m mem_free sensors
+    load_1m=$(echo "$sys" | awk '{print $1}')
+    mem_free=$(echo "$sys" | awk '{print $2}')
+    sensors=$(echo "$sys" | cut -d' ' -f3-)
+    # Convert space-separated sensors to comma-separated
+    sensors=$(echo "$sensors" | tr ' ' ',')
+
+    local ts
+    ts=$(timestamp)
+
+    echo "$ts,$rsrp,$rsrq,$rssi,$snr,$lat,$dl_bytes,$ul_bytes,$load_1m,$mem_free,$sensors"
+}
+
+# Scan DHCP leases and ping each device
+# Cache logread output once per cycle to avoid redundant reads
+# Called at the start of each daemon cycle; other functions read the cache file
+cache_logread() {
+    logread 2>/dev/null | grep -v \
+        -e 'dropbear\[' \
+        -e 'router-diag:' \
+        -e 'router-diag\[' \
+        -e 'authpriv\.' \
+        -e 'cron\[' \
+        -e 'crond\[' | \
+        tail -200 > /tmp/router-diag-logcache
+}
+
+# Collect recent system logs for Gemini analysis (reads from cache)
+# Returns: relevant log lines (max 50)
+collect_recent_logs() {
+    tail -50 /tmp/router-diag-logcache 2>/dev/null
+}
+
+# Scan system logs for error patterns that warrant Gemini analysis
+# Returns: trigger description string (empty if no errors found)
+# Writes matched log lines to /tmp/router-diag-log-errors for prompt inclusion
+check_log_triggers() {
+    local error_file="/tmp/router-diag-log-errors"
+
+    local logs=""
+    logs=$(cat /tmp/router-diag-logcache 2>/dev/null)
+
+    [ -z "$logs" ] && { rm -f "$error_file"; echo ""; return; }
+
+    # Scan for actionable error patterns
+    local triggers=""
+    local matched=""
+
+    # Kernel errors (hardware, driver, OOM)
+    local kern_errors
+    kern_errors=$(echo "$logs" | grep -E 'kern\.(err|crit|emerg|alert)' | tail -10)
+    if [ -n "$kern_errors" ]; then
+        triggers="${triggers}kernel_errors "
+        matched="${matched}${kern_errors}\n"
+    fi
+
+    # OOM killer
+    local oom
+    oom=$(echo "$logs" | grep -i 'out of memory\|oom-killer\|invoked oom' | tail -5)
+    if [ -n "$oom" ]; then
+        triggers="${triggers}oom_kill "
+        matched="${matched}${oom}\n"
+    fi
+
+    # Service crashes/errors
+    local daemon_errors
+    daemon_errors=$(echo "$logs" | grep -E 'daemon\.(err|crit)' | grep -v -e 'odhcpd.*ra_lifetime' | tail -10)
+    if [ -n "$daemon_errors" ]; then
+        triggers="${triggers}daemon_errors "
+        matched="${matched}${daemon_errors}\n"
+    fi
+
+    # dnsmasq specific errors (not just process down — config/upstream issues)
+    local dns_errors
+    dns_errors=$(echo "$logs" | grep -i 'dnsmasq' | grep -iE 'error|fail|refused|limit|cannot|broken' | grep -v 'limited to local subnets' | tail -5)
+    if [ -n "$dns_errors" ]; then
+        triggers="${triggers}dns_errors "
+        matched="${matched}${dns_errors}\n"
+    fi
+
+    # Firewall/nftables errors
+    local fw_errors
+    fw_errors=$(echo "$logs" | grep -iE 'nft|firewall' | grep -iE 'error|fail|cannot|invalid' | tail -5)
+    if [ -n "$fw_errors" ]; then
+        triggers="${triggers}firewall_errors "
+        matched="${matched}${fw_errors}\n"
+    fi
+
+    # Network interface state changes
+    local iface_events
+    iface_events=$(echo "$logs" | grep -i 'netifd' | grep -iE 'down|error|fail|timeout' | tail -5)
+    if [ -n "$iface_events" ]; then
+        triggers="${triggers}interface_events "
+        matched="${matched}${iface_events}\n"
+    fi
+
+    # WiFi/hostapd errors (not normal assoc/disassoc — actual errors)
+    local wifi_errors
+    wifi_errors=$(echo "$logs" | grep -i 'hostapd\|ieee80211' | grep -iE 'error|fail|crash|restart|radar|blocked' | tail -5)
+    if [ -n "$wifi_errors" ]; then
+        triggers="${triggers}wifi_errors "
+        matched="${matched}${wifi_errors}\n"
+    fi
+
+    # Write matched errors for prompt inclusion
+    if [ -n "$matched" ]; then
+        printf '%b' "$matched" > "$error_file"
+    else
+        rm -f "$error_file"
+    fi
+
+    # Deduplicate: if the matched errors are identical to the last assessed set
+    # (where Gemini said "no action"), suppress the trigger to avoid repeating
+    # analyses on stale log entries that linger in the syslog ring buffer
+    if [ -n "$triggers" ]; then
+        local current_hash
+        current_hash=$(printf '%b' "$matched" | md5sum | cut -d' ' -f1)
+        local assessed_hash=""
+        [ -f /tmp/router-diag-log-assessed ] && assessed_hash=$(cat /tmp/router-diag-log-assessed 2>/dev/null)
+        if [ "$current_hash" = "$assessed_hash" ]; then
+            # Same errors already assessed — suppress trigger
+            echo ""
+            return
+        fi
+        # Store current hash for comparison after analysis
+        echo "$current_hash" > /tmp/router-diag-log-hash
+    fi
+
+    echo "$triggers"
+}
+
+# Output: human-readable summary for Gemini prompt
+collect_dhcp_status() {
+    local lease_file="/tmp/dhcp.leases"
+    if [ ! -f "$lease_file" ] || [ ! -s "$lease_file" ]; then
+        echo "No active DHCP leases"
+        return
+    fi
+
+    # Check dnsmasq is listening on DHCP port
+    local dhcp_listening="no"
+    if netstat -ulnp 2>/dev/null | grep -q ":67 "; then
+        dhcp_listening="yes"
+    fi
+
+    local total=0 reachable=0 unreachable=""
+    local lan_down=0 iot_down=0
+    while read -r _expiry mac ip hostname _rest; do
+        [ -n "$ip" ] || continue
+        total=$((total + 1))
+        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+            reachable=$((reachable + 1))
+        else
+            local subnet="LAN"
+            case "$ip" in
+                192.168.30.*) subnet="IoT"; iot_down=$((iot_down + 1)) ;;
+                *) lan_down=$((lan_down + 1)) ;;
+            esac
+            unreachable="${unreachable}  - ${hostname:-unknown} ($ip, $mac) [$subnet]\n"
+        fi
+    done < "$lease_file"
+
+    local unreachable_count=$((total - reachable))
+    echo "DHCP port 67: $dhcp_listening, Leases: $total, Reachable: $reachable/$total"
+    if [ "$unreachable_count" -gt 0 ]; then
+        printf "Unreachable devices (%d):\n%b" "$unreachable_count" "$unreachable"
+    fi
+}
+
+# ==========================================================
+# Status Display
+# ==========================================================
+
+cmd_status() {
+    echo "=== router-diag Status ==="
+    echo ""
+
+    # Check daemon
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "Daemon:   RUNNING (PID $(cat "$PID_FILE"))"
+    else
+        echo "Daemon:   STOPPED"
+    fi
+
+    # Check USB
+    if is_usb_mounted; then
+        local usb_size usb_used usb_avail
+        usb_size=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $2}')
+        usb_used=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $3}')
+        usb_avail=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $4}')
+        echo "USB:      Mounted ($usb_used / $usb_size, $usb_avail free)"
+    else
+        echo "USB:      NOT MOUNTED"
+    fi
+
+    # Check config
+    if load_config && [ -n "$GEMINI_API_KEY" ]; then
+        echo "API Key:  Configured"
+    else
+        echo "API Key:  NOT SET — run '$PROG setup'"
+        return
+    fi
+
+    # Metrics file
+    if [ -f "$METRICS_FILE" ]; then
+        local lines
+        lines=$(wc -l < "$METRICS_FILE")
+        lines=$((lines - 1))  # minus header
+        echo "Metrics:  $lines records"
+    else
+        echo "Metrics:  No data"
+    fi
+
+    echo ""
+    echo "--- Live Readings ---"
+    echo ""
+
+    # Signal
+    local sig
+    sig=$(collect_signal)
+    set -- $sig
+    echo "Signal:   RSRP=$1 dBm  RSRQ=$2 dB  SNR=$4 dB"
+
+    # Latency
+    local lat
+    lat=$(collect_latency)
+    echo "Latency:  ${lat} ms"
+
+    # System
+    local sys
+    sys=$(collect_system)
+    set -- $sys
+    echo "System:   Load=$1  Free RAM=${2}KB  Temp1=${3}°C  Temp2=${4}°C"
+
+    echo ""
+    echo "--- Network Health ---"
+    echo ""
+
+    # Show health status from last check
+    if [ -f /tmp/router-diag-health-context ]; then
+        local health_line health_status health_failed health_ts
+        health_line=$(cat /tmp/router-diag-health-context)
+        health_status=$(echo "$health_line" | cut -d',' -f1)
+        health_failed=$(echo "$health_line" | cut -d',' -f2)
+        health_ts=$(echo "$health_line" | cut -d',' -f3)
+
+        local now ago_s ago_m
+        now=$(epoch)
+        ago_s=$((now - health_ts))
+        ago_m=$((ago_s / 60))
+
+        echo "Status:   $health_status (checked ${ago_m}m ago)"
+        if [ -n "$health_failed" ]; then
+            echo "Issues:   $health_failed"
+        fi
+    else
+        echo "Status:   No data (daemon not running or no check yet)"
+    fi
+
+    # Show recent fix attempts
+    local has_fixes=0
+    local fix_file
+    for fix_file in /tmp/router-diag-fix-*; do
+        [ -f "$fix_file" ] || continue
+        local svc_name info
+        svc_name=$(basename "$fix_file" | sed 's/router-diag-fix-//' | tr -cd 'a-zA-Z0-9_-')
+        info=$(get_fix_info "$svc_name")
+        if [ -n "$info" ]; then
+            if [ "$has_fixes" = "0" ]; then
+                echo ""
+                echo "Recent fix attempts:"
+                has_fixes=1
+            fi
+            local count ago mins
+            set -- $info; count="$1"; ago="$2"
+            mins=$((ago / 60))
+            echo "  $svc_name: $count attempt(s), ${mins}m ago"
+        fi
+    done
+
+    echo ""
+}
+
+# ==========================================================
+# LuCI JSON Output (for web UI)
+# ==========================================================
+
+cmd_detect_sensors() {
+    # Detects all available sensors and outputs them as a JSON array
+    # Format: [{"path": "...", "type": "...", "temp": 45}]
+    echo -n "["
+    local first=1
+    local tf
+    for tf in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+        [ -f "$tf" ] || continue
+        local path="$tf"
+        local type=""
+        if echo "$path" | grep -q "thermal_zone"; then
+            local type_file
+            type_file=$(echo "$path" | sed 's/temp$/type/')
+            [ -f "$type_file" ] && type=$(cat "$type_file" 2>/dev/null)
+        else
+            local name_file
+            name_file=$(echo "$path" | sed 's/temp[0-9]*_input$/name/')
+            [ -f "$name_file" ] && type=$(cat "$name_file" 2>/dev/null)
+        fi
+
+        local temp
+        temp=$(cat "$path" 2>/dev/null)
+        [ -n "$temp" ] && [ "$temp" -gt 1000 ] && temp=$((temp / 1000))
+
+        [ "$first" = "0" ] && echo -n ","
+        echo -n "{\"path\":\"$path\",\"type\":\"${type:-unknown}\",\"temp\":${temp:-0}}"
+        first=0
+    done
+    echo "]"
+}
+
+cmd_luci_json() {
+    # Output all status data as JSON — reads cached files only (no live AT commands)
+    # Used by the LuCI web view for fast page loads
+
+    load_config 2>/dev/null
+
+    # --- Daemon status ---
+    local daemon_running="false" daemon_pid=""
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        daemon_running="true"
+        daemon_pid=$(cat "$PID_FILE")
+    fi
+
+    # --- USB info ---
+    local usb_mounted="false" usb_size="" usb_used="" usb_avail=""
+    if is_usb_mounted; then
+        usb_mounted="true"
+        usb_size=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $2}')
+        usb_used=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $3}')
+        usb_avail=$(df -h "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $4}')
+    fi
+
+    # --- API key ---
+    local api_key_set="false"
+    [ -n "$GEMINI_API_KEY" ] && api_key_set="true"
+
+    # --- Metrics count ---
+    local metrics_count=0
+    if [ -f "$METRICS_FILE" ]; then
+        metrics_count=$(wc -l < "$METRICS_FILE")
+        metrics_count=$((metrics_count - 1))
+        [ "$metrics_count" -lt 0 ] && metrics_count=0
+    fi
+
+    # --- Live signal & connection readings ---
+    local last_ts="" last_rsrp="" last_rsrq="" last_rssi="" last_snr=""
+    local last_latency=""
+    local last_load="" last_mem=""
+
+    last_ts=$(timestamp)
+
+    # Signal (live AT command)
+    local sig
+    sig=$(collect_signal 2>/dev/null)
+    if [ -n "$sig" ]; then
+        set -- $sig
+        last_rsrp="$1"; last_rsrq="$2"; last_rssi="$3"; last_snr="$4"
+    fi
+
+    # Latency (live ping)
+    last_latency=$(collect_latency 2>/dev/null)
+
+    # System stats (live from /proc)
+    local sys
+    sys=$(collect_system 2>/dev/null)
+    if [ -n "$sys" ]; then
+        last_load=$(echo "$sys" | awk '{print $1}')
+        last_mem=$(echo "$sys" | awk '{print $2}')
+        # Sensors values are from field 3 onwards
+        local sensor_vals
+        sensor_vals=$(echo "$sys" | cut -d' ' -f3- | tr ' ' ',')
+    fi
+
+    # --- Health status ---
+    local health_status="unknown" health_failed="" health_ago=""
+    if [ -f /tmp/router-diag-health-context ]; then
+        local hline hts
+        hline=$(cat /tmp/router-diag-health-context)
+        health_status=$(echo "$hline" | cut -d',' -f1)
+        health_failed=$(echo "$hline" | cut -d',' -f2)
+        hts=$(echo "$hline" | cut -d',' -f3)
+        if [ -n "$hts" ] && [ "$hts" -gt 0 ] 2>/dev/null; then
+            health_ago=$(( $(epoch) - hts ))
+        fi
+    fi
+
+    # --- Fix attempts ---
+    local fixes_json=""
+    local fix_file
+    for fix_file in /tmp/router-diag-fix-*; do
+        [ -f "$fix_file" ] || continue
+        local svc_name info
+        svc_name=$(basename "$fix_file" | sed 's/router-diag-fix-//' | tr -cd 'a-zA-Z0-9_-')
+        info=$(get_fix_info "$svc_name")
+        [ -n "$info" ] || continue
+        local fcount fago fmins
+        set -- $info; fcount="$1"; fago="$2"
+        fmins=$((fago / 60))
+        [ -n "$fixes_json" ] && fixes_json="$fixes_json,"
+        fixes_json="$fixes_json{\"service\":\"$svc_name\",\"count\":$fcount,\"mins_ago\":$fmins}"
+    done
+
+    # --- Last analysis excerpt ---
+    local last_analysis=""
+    if [ -f "$ANALYSIS_LOG" ]; then
+        # Extract the last analysis block (between last "=== Analysis:" and "---")
+        last_analysis=$(awk '
+            /^=== Analysis:/ { block=""; capturing=1; next }
+            /^---$/ { capturing=0 }
+            capturing { block = block (block ? "\n" : "") $0 }
+            END { print block }
+        ' "$ANALYSIS_LOG")
+    fi
+
+    # --- Escape strings for JSON ---
+    json_escape() {
+        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | \
+            awk '{printf "%s", (NR>1 ? "\\n" : "") $0}'
+    }
+
+    local esc_analysis
+    esc_analysis=$(json_escape "$last_analysis")
+    local esc_failed
+    esc_failed=$(json_escape "$health_failed")
+
+    # --- Build JSON ---
+    cat << JSONEOF
+{
+  "version": "$VERSION",
+  "daemon": {
+    "running": $daemon_running,
+    "pid": $([ -n "$daemon_pid" ] && echo "$daemon_pid" || echo "null")
+  },
+  "usb": {
+    "mounted": $usb_mounted,
+    "size": "$usb_size",
+    "used": "$usb_used",
+    "available": "$usb_avail"
+  },
+  "api_key_set": $api_key_set,
+  "metrics_count": $metrics_count,
+  "last_metrics": {
+    "timestamp": "$last_ts",
+    "rsrp": "$last_rsrp",
+    "rsrq": "$last_rsrq",
+    "rssi": "$last_rssi",
+    "snr": "$last_snr",
+    "latency_ms": "$last_latency",
+    "load_1m": "$last_load",
+    "mem_free_kb": "$last_mem",
+    "sensors": [${sensor_vals:-0}]
+  },
+  "health": {
+    "status": "$health_status",
+    "failed": "$esc_failed",
+    "seconds_ago": ${health_ago:-null}
+  },
+  "fixes": [${fixes_json}],
+  "last_analysis": "$esc_analysis",
+  "sensors_detected": $(cmd_detect_sensors),
+  "config": {
+    "latency_threshold": "$TRIGGER_LATENCY",
+    "hourly_check": "$TRIGGER_HOURLY",
+    "api_cooldown": "$API_COOLDOWN",
+    "email_enabled": "$EMAIL_ENABLED",
+    "email_to": "$EMAIL_TO",
+    "collect_interval": "$COLLECT_INTERVAL",
+    "max_file_size_mb": "$((MAX_FILE_SIZE / 1048576))",
+    "sensors": "$SENSORS"
+  }
+}
+JSONEOF
+}
+
+# ==========================================================
+# Gemini API Client
+# ==========================================================
+
+gemini_request() {
+    local prompt="$1"
+    local response
+
+    [ -n "$GEMINI_API_KEY" ] || {
+        log_err "No API key configured"
+        return 1
+    }
+
+    # Escape the prompt for JSON (handle quotes, newlines, control chars)
+    local escaped_prompt
+    escaped_prompt=$(printf '%s' "$prompt" | tr -d '\r' | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g')
+
+    local payload
+    payload=$(cat << JSONEOF
+{
+  "contents": [{
+    "parts": [{
+      "text": "$escaped_prompt"
+    }]
+  }],
+  "generationConfig": {
+    "temperature": 1.0,
+    "maxOutputTokens": 8192
+  },
+  "systemInstruction": {
+    "parts": [{
+      "text": "You are a network diagnostics expert for an MF286D LTE router running OpenWRT with TCP BBR congestion control. Analyze metrics and provide specific, actionable recommendations. Format your response as:\nSTATUS: [GOOD|WARNING|CRITICAL]\nDIAGNOSIS: [1-2 sentence summary]\nRECOMMENDATIONS:\n- [specific action 1]\n- [specific action 2]\nACTION: [action type]\n\nACTION types:\n- none — everything is fine, no action needed\n- restart_service:name — restart a specific service (e.g., restart_service:dnsmasq, restart_service:adblock-lean, restart_service:https-dns-proxy)\n- reload_firewall — reload firewall rules via /etc/init.d/firewall restart\n- restart_wifi — restart all WiFi radios (ONLY if SSIDs have stopped broadcasting)\n- flush_arp — flush the ARP cache (safe, use when pings fail but network looks healthy)\n- investigate_dns — DNS is broken and auto-fixes exhausted, needs manual diagnosis\n- investigate_network — complex network issue, needs human investigation\n\nMonitored services: dnsmasq (DNS+DHCP), https-dns-proxy (DoH), firewall (nftables), adblock-lean (ad blocking), WiFi (main+IoT SSIDs). DHCP lease status and device reachability (ping) are included. System logs from logread are provided — use these to identify root causes of failures rather than guessing. Log entries show the actual error messages from crashed services, kernel warnings, OOM events, and interface state changes. Network conflict detection runs each cycle: IP conflicts (auto-fixed when DHCP client involved), duplicate MACs, and rogue static IPs are reported. WiFi thrash detection monitors for devices rapidly associating/disassociating — thrashing devices are auto-blocked temporarily and unblocked after a cooldown. System health monitors temperature (warning 80C, critical 85C), memory (alert below 20MB free), and load. If temperature is critical AND load > 1.0, the heaviest non-essential process is automatically killed. All conflicts, blocks, and system actions already handled are shown for context.\n\nIMPORTANT: Unreachable devices are INFORMATIONAL ONLY and NEVER a reason to take action. Devices go offline, sleep, leave the network — this is completely normal at all hours. Do NOT recommend restart_wifi, flush_arp, or any action based on unreachable device counts. Only recommend WiFi restart if SSIDs have actually stopped broadcasting (shown in service health checks).\n\nIMPORTANT: The traffic volume metric shows bytes transferred on the WAN interface during the collection interval. This is NOT a speed test. Low traffic volume simply means nothing was being actively downloaded at that moment — it does NOT indicate a slow or degraded connection. Never diagnose throughput or speed problems from this metric alone.\n\nIMPORTANT: Check RECENT AUTO-FIX ATTEMPTS in the prompt. If a service or interface has already been restarted 2+ times in the last hour, do NOT recommend restarting it again — use investigate_dns or investigate_network instead.\n\nIMPORTANT: LTE signal strength (RSRP) between -100 and -112 dBm is the NORMAL BASELINE for this fixed installation. This router is in a rural location and has always operated in this range. Do NOT flag RSRP values in this range as warnings or issues. Do NOT recommend antenna repositioning, external antennas, or investigation for signal strength alone. Only flag signal as a problem if RSRP drops below -115 dBm AND SNR drops below 5 dB simultaneously, indicating genuine signal degradation rather than normal fluctuation. NEVER use investigate_network for LTE signal strength — signal strength is not actionable and not a network issue."
+    }]
+  }
+}
+JSONEOF
+)
+
+    response=$(curl -s --max-time 30 \
+        "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
+        -H 'Content-Type: application/json' \
+        -H "x-goog-api-key: $GEMINI_API_KEY" \
+        -d "$payload" 2>/dev/null)
+
+    if [ -z "$response" ]; then
+        log_err "Empty response from Gemini API"
+        return 1
+    fi
+
+    # Check for errors (jsonfilter for robust JSON parsing)
+    local err_msg
+    err_msg=$(echo "$response" | jsonfilter -e '@.error.message' 2>/dev/null)
+    if [ -n "$err_msg" ]; then
+        log_err "Gemini API error: $err_msg"
+        return 1
+    fi
+
+    # Extract text from response using jsonfilter
+    local text
+    text=$(echo "$response" | jsonfilter -e '@.candidates[0].content.parts[0].text' 2>/dev/null)
+
+    # Unescape JSON strings
+    text=$(printf '%b' "$text" 2>/dev/null || echo "$text")
+
+    echo "$text"
+}
+
+# ==========================================================
+# Analysis Engine
+# ==========================================================
+
+build_analysis_prompt() {
+    local current_metrics="$1"
+    local trigger_reason="$2"
+
+    # Parse current metrics
+    local ts rsrp rsrq rssi snr lat dl ul load mem temp1 temp2
+    IFS=',' read ts rsrp rsrq rssi snr lat dl ul load mem temp1 temp2 << METRICS
+$current_metrics
+METRICS
+
+    # Get recent history (last 12 readings = ~1 hour)
+    local history=""
+    if [ -f "$METRICS_FILE" ]; then
+        history=$(tail -12 "$METRICS_FILE" | head -11)
+    fi
+
+    # Get health context
+    local health_status="OK"
+    local health_failed=""
+    if [ -f /tmp/router-diag-health-context ]; then
+        local health_line
+        health_line=$(cat /tmp/router-diag-health-context)
+        health_status=$(echo "$health_line" | cut -d',' -f1)
+        health_failed=$(echo "$health_line" | cut -d',' -f2)
+    fi
+
+    # Get recent auto-fix attempts
+    local fix_history=""
+    local fix_file
+    for fix_file in /tmp/router-diag-fix-*; do
+        [ -f "$fix_file" ] || continue
+        local svc_name
+        svc_name=$(basename "$fix_file" | sed 's/router-diag-fix-//' | tr -cd 'a-zA-Z0-9_-')
+        local info
+        info=$(get_fix_info "$svc_name")
+        if [ -n "$info" ]; then
+            local count ago
+            set -- $info; count="$1"; ago="$2"
+            local mins=$((ago / 60))
+            fix_history="${fix_history}  - $svc_name: $count attempt(s), ${mins}m ago\n"
+        fi
+    done
+
+    # Build prompt
+    cat << PROMPT
+Analyze this LTE router diagnostic data. Trigger: $trigger_reason
+
+CURRENT METRICS ($ts):
+- Signal: RSRP=${rsrp}dBm, RSRQ=${rsrq}dB, SNR=${snr}dB
+- Latency: ${lat}ms
+- Traffic volume: DL=${dl} bytes, UL=${ul} bytes transferred in last ${COLLECT_INTERVAL}s (NOTE: this is traffic volume observed on the interface, NOT a speed test. Low values simply mean nothing was being downloaded — they do NOT indicate a slow connection. Do NOT diagnose throughput issues from this metric.)
+- System: Load=$load, Free RAM=${mem}KB, Temp1=${temp1}C, Temp2=${temp2}C
+
+NETWORK HEALTH STATUS: $health_status${health_failed:+ (failed: $health_failed)}
+
+SERVICE STATUS:
+- dnsmasq (DNS+DHCP): $(pgrep -x dnsmasq >/dev/null 2>&1 && echo "running" || echo "DOWN")
+- https-dns-proxy (DoH): $(pgrep "https-dns-proxy" >/dev/null 2>&1 && echo "running" || echo "DOWN")
+- firewall (nftables): $(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0") chains loaded
+- adblock-lean: $([ -f /etc/init.d/adblock-lean ] && { [ -f /var/run/adblock-lean/abl-blocklist.gz ] && echo "active (blocklist loaded)" || echo "DOWN (no blocklist)"; } || echo "not installed")
+
+DHCP & DEVICE REACHABILITY:
+$(collect_dhcp_status)
+
+NETWORK CONFLICTS:
+$(cat /tmp/router-diag-conflicts 2>/dev/null || echo "No data")
+
+WIFI DEVICE STABILITY:
+$(cat /tmp/router-diag-thrash-status 2>/dev/null || echo "No data")
+
+RECENT AUTO-FIX ATTEMPTS:
+$([ -n "$fix_history" ] && printf '%b' "$fix_history" || echo "  None")
+
+RECENT HISTORY (CSV: timestamp,rsrp,rsrq,rssi,snr,latency,dl,ul,load,mem,temp1,temp2):
+$([ -n "$history" ] && echo "$history" || echo "No history yet")
+
+SYSTEM LOGS (recent relevant entries):
+$(collect_recent_logs | tail -30)
+
+LOG ERRORS DETECTED:
+$([ -f /tmp/router-diag-log-errors ] && cat /tmp/router-diag-log-errors || echo "None")
+
+The router has already attempted automatic fixes for any health issues shown above. If health is FAILED or DEGRADED, check the auto-fix attempts and the system logs for root cause before recommending further action. The logs often reveal WHY a service failed — use that information to recommend the right fix rather than blindly restarting.
+PROMPT
+}
+
+run_analysis() {
+    local metrics="$1"
+    local trigger="$2"
+
+    local prompt
+    prompt=$(build_analysis_prompt "$metrics" "$trigger")
+
+    log_msg "Running Gemini analysis (trigger: $trigger)..."
+
+    local result
+    result=$(gemini_request "$prompt")
+
+    if [ -z "$result" ]; then
+        log_err "Analysis failed — no response"
+        return 1
+    fi
+
+    # Log the result
+    {
+        echo "=== Analysis: $(timestamp) ==="
+        echo "Trigger: $trigger"
+        echo ""
+        echo "$result"
+        echo ""
+    } >> "$ANALYSIS_LOG"
+
+    echo "$result"
+
+    # Parse STATUS and ACTION
+    local status action
+    status=$(echo "$result" | grep -oE 'STATUS:[[:space:]]*(GOOD|WARNING|CRITICAL)' | sed 's/STATUS:[[:space:]]*//')
+    action=$(echo "$result" | grep -oE 'ACTION:[[:space:]]*.+' | sed 's/ACTION:[[:space:]]*//')
+
+    [ -n "$action" ] || action="none"
+
+    # Handle actions autonomously
+    case "$action" in
+        restart_service:*)
+            local svc
+            svc=$(echo "$action" | sed 's/restart_service://')
+            log_msg "GEMINI: Restart service $svc recommended"
+            if attempt_fix_service "$svc"; then
+                echo "[AUTO-APPLIED] Service restart: $svc ($(timestamp))" >> "$ANALYSIS_LOG"
+            else
+                echo "[FAILED] Service restart: $svc ($(timestamp))" >> "$ANALYSIS_LOG"
+            fi
+            ;;
+        reload_firewall)
+            log_msg "GEMINI: Firewall reload recommended"
+            if attempt_fix_firewall; then
+                echo "[AUTO-APPLIED] Firewall reload ($(timestamp))" >> "$ANALYSIS_LOG"
+            else
+                echo "[FAILED] Firewall reload ($(timestamp))" >> "$ANALYSIS_LOG"
+            fi
+            ;;
+        restart_interface:*)
+            local iface
+            iface=$(echo "$action" | sed 's/restart_interface://')
+            # SAFETY: Block ALL interface restarts — use investigate_network instead
+            log_msg "BLOCKED: Refusing to restart interface $iface (all interface restarts disabled)"
+            echo "[BLOCKED] Interface restart: $iface - all interface restarts disabled ($(timestamp))" >> "$ANALYSIS_LOG"
+            ;;
+        restart_wifi)
+            log_msg "GEMINI: WiFi restart recommended"
+            if attempt_fix_wifi; then
+                echo "[AUTO-APPLIED] WiFi restart ($(timestamp))" >> "$ANALYSIS_LOG"
+            else
+                echo "[FAILED] WiFi restart ($(timestamp))" >> "$ANALYSIS_LOG"
+            fi
+            ;;
+        flush_arp)
+            log_msg "GEMINI: ARP cache flush recommended"
+            local before_entries
+            before_entries=$(ip neigh show 2>/dev/null | grep -c "" || echo "0")
+            ip neigh flush all 2>/dev/null
+            sleep 1
+            local after_entries
+            after_entries=$(ip neigh show 2>/dev/null | grep -c "" || echo "0")
+            echo "[AUTO-APPLIED] ARP cache flush ($(timestamp))" >> "$ANALYSIS_LOG"
+            epoch > /tmp/router-diag-last-fix
+            send_email "[router-diag] Auto-fix applied — ARP cache flushed" \
+                "ARP cache flushed to resolve stale entries.\n\nBefore: $before_entries ARP entries\nAfter:  $after_entries ARP entries (will repopulate as devices communicate)\n\nTime: $(timestamp)"
+            ;;
+        investigate_dns)
+            log_msg "NOTIFY: DNS investigation needed — sending email"
+            echo "[EMAIL] DNS investigation needed ($(timestamp))" >> "$ANALYSIS_LOG"
+            send_email "[router-diag] DNS broken — investigation needed" \
+                "Trigger: $trigger\n\nAutomatic fixes have been exhausted. DNS resolution is failing.\n\nFull diagnosis:\n$result\n\nManual investigation required."
+            ;;
+        investigate_network)
+            log_msg "NOTIFY: Network investigation needed — sending email"
+            echo "[EMAIL] Network investigation needed ($(timestamp))" >> "$ANALYSIS_LOG"
+            send_email "[router-diag] Network issue — investigation needed" \
+                "Trigger: $trigger\n\nAutomatic fixes have been exhausted or the issue is too complex.\n\nFull diagnosis:\n$result\n\nManual investigation required."
+            ;;
+        none)
+            # CRITICAL status always gets an email even with no action
+            if [ "$status" = "CRITICAL" ]; then
+                log_msg "NOTIFY: CRITICAL status — sending email"
+                echo "[EMAIL] Critical status notification sent ($(timestamp))" >> "$ANALYSIS_LOG"
+                send_email "[router-diag] CRITICAL — attention needed" \
+                    "Trigger: $trigger\n\nFull diagnosis:\n$result"
+            fi
+            # Mark log errors as assessed so identical entries don't re-trigger
+            [ -f /tmp/router-diag-log-hash ] && \
+                cp /tmp/router-diag-log-hash /tmp/router-diag-log-assessed
+            ;;
+        *)
+            log_msg "Unknown action in response: $action (not applied)"
+            ;;
+    esac
+
+    echo "---" >> "$ANALYSIS_LOG"
+    echo "" >> "$ANALYSIS_LOG"
+}
+
+cmd_analyze() {
+    mount_usb || die "USB not available"
+    load_config || die "Not configured. Run '$PROG setup' first."
+
+    echo "Collecting metrics..."
+    local metrics
+    metrics=$(collect_all_metrics)
+
+    echo "Sending to Gemini for analysis..."
+    echo ""
+
+    local result
+    result=$(run_analysis "$metrics" "manual")
+
+    if [ -n "$result" ]; then
+        echo "$result"
+    else
+        echo "Analysis failed. Check '$PROG log' for details."
+    fi
+}
+
+# ==========================================================
+# History & Log Commands
+# ==========================================================
+
+cmd_history() {
+    mount_usb || die "USB not available"
+
+    local count="${1:-20}"
+
+    echo "=== Recent Metrics (last $count entries) ==="
+    echo ""
+
+    if [ ! -f "$METRICS_FILE" ]; then
+        echo "No metrics data. Start the daemon first."
+        return
+    fi
+
+    # Print header
+    head -1 "$METRICS_FILE"
+    echo "---"
+
+    # Print last N entries
+    tail -"$count" "$METRICS_FILE"
+}
+
+cmd_log() {
+    mount_usb || die "USB not available"
+
+    local count="${1:-1}"
+
+    if [ ! -f "$ANALYSIS_LOG" ]; then
+        echo "No analysis log. Run '$PROG analyze' first."
+        return
+    fi
+
+    if [ "$count" = "all" ]; then
+        cat "$ANALYSIS_LOG"
+    else
+        # Show last N analysis blocks
+        local total
+        total=$(grep -c "^=== Analysis:" "$ANALYSIS_LOG")
+        if [ "$total" -eq 0 ]; then
+            echo "No analyses recorded yet."
+            return
+        fi
+
+        local skip=$((total - count))
+        [ "$skip" -lt 0 ] && skip=0
+
+        awk -v skip="$skip" '
+            /^=== Analysis:/ { block++ }
+            block > skip { print }
+        ' "$ANALYSIS_LOG"
+    fi
+}
+
+# ==========================================================
+# CSV Rotation
+# ==========================================================
+
+rotate_metrics() {
+    # Size-based rotation: cap metrics.csv and analysis.log at MAX_FILE_SIZE (default 2GB)
+    local file size
+    for file in "$METRICS_FILE" "$ANALYSIS_LOG"; do
+        [ -f "$file" ] || continue
+        size=$(wc -c < "$file")
+        if [ "$size" -gt "$MAX_FILE_SIZE" ]; then
+            local basename=$(basename "$file")
+            local archive_name="${basename%.*}-$(date '+%Y%m%d-%H%M%S').${basename##*.}.gz"
+            log_msg "Rotating $basename: ${size} bytes exceeds ${MAX_FILE_SIZE} limit"
+            # Keep last 25% of file (preserves recent history)
+            local keep_lines=$(( $(wc -l < "$file") / 4 ))
+            if echo "$file" | grep -q "metrics"; then
+                # Metrics: preserve header row
+                { head -1 "$file"; tail -n "$keep_lines" "$file"; } | gzip > "$HISTORY_DIR/$archive_name"
+                { head -1 "$file"; tail -n "$keep_lines" "$file"; } > "/tmp/router-diag-rotate-tmp"
+            else
+                # Analysis log: no header
+                tail -n "$keep_lines" "$file" | gzip > "$HISTORY_DIR/$archive_name"
+                tail -n "$keep_lines" "$file" > "/tmp/router-diag-rotate-tmp"
+            fi
+            mv "/tmp/router-diag-rotate-tmp" "$file"
+            log_msg "Rotated $basename, archived to $archive_name"
+        fi
+    done
+}
+
+# ==========================================================
+# Network Health Monitoring
+# ==========================================================
+
+# Check if a fix attempt is allowed
+# Guards: global daily cap (6 total), per-service hourly cap (2), WiFi daily cap (4)
+# Args: service_name
+# Returns: 0 if allowed, 1 if exhausted
+fix_attempt_allowed() {
+    local service="$1"
+    local state_file="/tmp/router-diag-fix-${service}"
+    local now
+    now=$(epoch)
+
+    # Global daily cap — max 6 automated actions across ALL services per 24 hours
+    local global_file="/tmp/router-diag-fix-daily-global"
+    if [ -f "$global_file" ]; then
+        local global_start global_count
+        read global_start global_count < "$global_file"
+        local global_elapsed=$((now - global_start))
+        if [ "$global_elapsed" -ge 86400 ]; then
+            echo "$now 1" > "$global_file"
+        elif [ "$global_count" -ge 6 ]; then
+            log_msg "GLOBAL DAILY CAP: Action blocked for $service — $global_count total actions in last 24h"
+            # Only email once when cap first hit (count == 6), then bump to 7 to prevent re-sending
+            if [ "$global_count" -eq 6 ]; then
+                send_email "[router-diag] Daily action cap reached — all auto-fixes paused" \
+                    "Router-diag has performed $global_count automated actions in the last 24 hours.\nAll further automatic fixes are paused until the cap resets.\n\nThis suggests a recurring issue that needs manual investigation.\n\nTime: $(timestamp)"
+                echo "$global_start 7" > "$global_file"
+            fi
+            return 1
+        else
+            echo "$global_start $((global_count + 1))" > "$global_file"
+        fi
+    else
+        echo "$now 1" > "$global_file"
+    fi
+
+    # Daily cap for WiFi restarts (max 4 per 24 hours)
+    if [ "$service" = "wifi" ]; then
+        local daily_file="/tmp/router-diag-fix-wifi-daily"
+        if [ -f "$daily_file" ]; then
+            local daily_start daily_count
+            read daily_start daily_count < "$daily_file"
+            local daily_elapsed=$((now - daily_start))
+            if [ "$daily_elapsed" -ge 86400 ]; then
+                # Reset after 24 hours
+                echo "$now 1" > "$daily_file"
+            elif [ "$daily_count" -ge 4 ]; then
+                log_msg "DAILY CAP: WiFi restart blocked — $daily_count restarts in last 24h"
+                # Only email once when cap first hit (count == 4), then bump to 5
+                if [ "$daily_count" -eq 4 ]; then
+                    send_email "[router-diag] WiFi restart daily cap reached" \
+                        "WiFi has been restarted $daily_count times in the last 24 hours.\nNo further WiFi restarts will be attempted until the cap resets.\n\nTime: $(timestamp)"
+                    echo "$daily_start 5" > "$daily_file"
+                fi
+                return 1
+            else
+                echo "$daily_start $((daily_count + 1))" > "$daily_file"
+            fi
+        else
+            echo "$now 1" > "$daily_file"
+        fi
+    fi
+
+    if [ ! -f "$state_file" ]; then
+        echo "$now 1" > "$state_file"
+        return 0
+    fi
+
+    local last_time attempt_count
+    read last_time attempt_count < "$state_file"
+
+    local elapsed=$((now - last_time))
+
+    # Reset after 1 hour
+    if [ "$elapsed" -ge 3600 ]; then
+        echo "$now 1" > "$state_file"
+        return 0
+    fi
+
+    if [ "$attempt_count" -ge 2 ]; then
+        return 1
+    fi
+
+    echo "$last_time $((attempt_count + 1))" > "$state_file"
+    return 0
+}
+
+# Get fix attempt info for a service (for status/prompt display)
+# Args: service_name
+# Returns: "count seconds_ago" or "" if no attempts
+get_fix_info() {
+    local service="$1"
+    local state_file="/tmp/router-diag-fix-${service}"
+
+    [ -f "$state_file" ] || return
+
+    local last_time attempt_count
+    read last_time attempt_count < "$state_file"
+
+    local now
+    now=$(epoch)
+    local ago=$((now - last_time))
+
+    # Only show if within the last hour
+    if [ "$ago" -lt 3600 ]; then
+        echo "$attempt_count $ago"
+    fi
+}
+
+attempt_fix_service() {
+    local service="$1"
+
+    if ! fix_attempt_allowed "$service"; then
+        log_err "Fix attempts exhausted for $service (2/hour max)"
+        send_email "[router-diag] Fix failed — $service restart attempts exhausted" \
+            "Service $service is down and auto-restart attempts have been exhausted (2 per hour).\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+
+    local before_state="DOWN (not running)"
+    log_msg "AUTO-FIX: Restarting service $service"
+    /etc/init.d/"$service" restart 2>/dev/null
+
+    # Service-specific settle delays (measured startup times + margin)
+    case "$service" in
+        adblock-lean) sleep 110 ;;  # measured ~80s + 30s margin
+        dnsmasq)      sleep 8 ;;    # measured ~5.5s + margin
+        https-dns-proxy) sleep 3 ;; # starts near-instantly
+        *)            sleep 5 ;;    # safe default
+    esac
+
+    # Verify it's running
+    if pgrep -x "$service" >/dev/null 2>&1; then
+        local pid
+        pid=$(pgrep -x "$service" | head -1)
+        local after_state="UP (running, PID $pid)"
+        log_msg "AUTO-FIX: $service restarted successfully"
+        epoch > /tmp/router-diag-last-fix
+        send_email "[router-diag] Auto-fix applied — $service restarted" \
+            "Service: $service\n\nBefore: $before_state\nAfter:  $after_state\n\nTime: $(timestamp)"
+        return 0
+    else
+        local after_state="STILL DOWN (not running after restart)"
+        log_err "AUTO-FIX: $service restart failed"
+        send_email "[router-diag] Fix failed — $service did not restart" \
+            "Service: $service\n\nBefore: $before_state\nAfter:  $after_state\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+}
+
+attempt_fix_interface() {
+    local iface="$1"
+
+    # SAFETY: NEVER restart WAN or IoT interfaces
+    # WAN: QMI modem connection — restarting tears down the cellular link and can crash the router
+    # IoT: Sleeping IoT devices appear "unreachable" which is normal, not a fault
+    case "$iface" in
+        wan|wan6|iot)
+            log_msg "BLOCKED: Refusing to restart interface $iface (safety hard-block)"
+            return 1
+            ;;
+    esac
+
+    if ! fix_attempt_allowed "interface-${iface}"; then
+        log_err "Fix attempts exhausted for interface $iface (2/hour max)"
+        send_email "[router-diag] Fix failed — $iface restart attempts exhausted" \
+            "Interface $iface is down and auto-restart attempts have been exhausted (2 per hour).\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+
+    local before_state="DOWN"
+    log_msg "AUTO-FIX: Restarting interface $iface"
+    ifdown "$iface" 2>/dev/null
+    sleep 3
+    ifup "$iface" 2>/dev/null
+    sleep 5
+
+    # Verify it's up
+    local status_json
+    status_json=$(ifstatus "$iface" 2>/dev/null)
+    if echo "$status_json" | grep -q '"up": true'; then
+        local ip
+        ip=$(echo "$status_json" | sed -n 's/.*"address":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        local after_state="UP${ip:+ (IP: $ip)}"
+        log_msg "AUTO-FIX: Interface $iface is back up"
+        epoch > /tmp/router-diag-last-fix
+        send_email "[router-diag] Auto-fix applied — interface $iface restarted" \
+            "Interface: $iface\n\nBefore: $before_state\nAfter:  $after_state\n\nTime: $(timestamp)"
+        return 0
+    else
+        local after_state="STILL DOWN (not up after restart)"
+        log_err "AUTO-FIX: Interface $iface did not come back up"
+        send_email "[router-diag] Fix failed — interface $iface still down" \
+            "Interface: $iface\n\nBefore: $before_state\nAfter:  $after_state\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+}
+
+attempt_fix_wifi() {
+    if ! fix_attempt_allowed "wifi"; then
+        log_err "Fix attempts exhausted for WiFi (2/hour max)"
+        send_email "[router-diag] Fix failed — WiFi restart attempts exhausted" \
+            "WiFi is down and auto-restart attempts have been exhausted (2 per hour).\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+
+    # Capture before state
+    local before_ssids
+    before_ssids=$(iwinfo 2>/dev/null | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
+    local before_state="${before_ssids:-no SSIDs broadcasting}"
+
+    log_msg "AUTO-FIX: Restarting WiFi"
+    wifi down 2>/dev/null
+    sleep 3
+    wifi up 2>/dev/null
+    sleep 5
+
+    # Verify at least one SSID is broadcasting
+    local after_ssids
+    after_ssids=$(iwinfo 2>/dev/null | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
+    if [ -n "$after_ssids" ]; then
+        local after_state="broadcasting: $after_ssids"
+        log_msg "AUTO-FIX: WiFi restarted successfully"
+        epoch > /tmp/router-diag-last-fix
+        send_email "[router-diag] Auto-fix applied — WiFi restarted" \
+            "WiFi radios restarted.\n\nBefore: $before_state\nAfter:  $after_state\n\nTime: $(timestamp)"
+        return 0
+    else
+        local after_state="STILL DOWN (no SSIDs broadcasting after restart)"
+        log_err "AUTO-FIX: WiFi restart failed — no SSIDs detected"
+        send_email "[router-diag] Fix failed — WiFi not broadcasting after restart" \
+            "WiFi radios restarted but no SSIDs detected.\n\nBefore: $before_state\nAfter:  $after_state\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+}
+
+attempt_fix_firewall() {
+    if ! fix_attempt_allowed "firewall"; then
+        log_err "Fix attempts exhausted for firewall (2/hour max)"
+        send_email "[router-diag] Fix failed — firewall reload attempts exhausted" \
+            "Firewall rules are not loaded and auto-reload attempts have been exhausted (2 per hour).\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+
+    # Capture before state
+    local before_chains
+    before_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    local before_state="BROKEN ($before_chains nftables chains loaded)"
+
+    log_msg "AUTO-FIX: Reloading firewall"
+    /etc/init.d/firewall restart 2>/dev/null
+    sleep 5
+
+    # Verify rules are loaded (a working firewall has many chains)
+    local after_chains
+    after_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    if [ "$after_chains" -gt 5 ] 2>/dev/null; then
+        local after_state="OK ($after_chains nftables chains loaded)"
+        log_msg "AUTO-FIX: Firewall reloaded successfully"
+        epoch > /tmp/router-diag-last-fix
+        send_email "[router-diag] Auto-fix applied — firewall reloaded" \
+            "Firewall rules reloaded.\n\nBefore: $before_state\nAfter:  $after_state\n\nTime: $(timestamp)"
+        return 0
+    else
+        local after_state="STILL BROKEN ($after_chains nftables chains loaded)"
+        log_err "AUTO-FIX: Firewall reload failed — insufficient rules"
+        send_email "[router-diag] Fix failed — firewall rules not loaded after restart" \
+            "Firewall was restarted but rules are not properly loaded.\n\nBefore: $before_state\nAfter:  $after_state\n\nManual intervention required.\nTime: $(timestamp)"
+        return 1
+    fi
+}
+
+attempt_fix_dns() {
+    # Check if dnsmasq is running
+    if ! pgrep -x dnsmasq >/dev/null 2>&1; then
+        log_msg "AUTO-FIX: dnsmasq is down, attempting restart"
+        attempt_fix_service "dnsmasq"
+        return $?
+    fi
+
+    # Check if https-dns-proxy is running
+    if ! pgrep "https-dns-proxy" >/dev/null 2>&1; then
+        log_msg "AUTO-FIX: https-dns-proxy is down, attempting restart"
+        attempt_fix_service "https-dns-proxy"
+        return $?
+    fi
+
+    # Both running but DNS still fails — escalate immediately
+    log_err "DNS resolution failing but dnsmasq and https-dns-proxy are running — escalating"
+    return 1
+}
+
+# Main health check — runs each cycle
+# Sets: HEALTH_STATUS (OK/DEGRADED/FAILED), HEALTH_FAILED_SERVICES (comma-separated)
+check_network_health() {
+    local failed_services=""
+    local critical_fail=0
+    local non_critical_fail=0
+
+    # DNS resolution
+    if ! nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
+        failed_services="${failed_services}dns,"
+        critical_fail=1
+        attempt_fix_dns
+    fi
+
+    # dnsmasq running
+    if ! pgrep -x dnsmasq >/dev/null 2>&1; then
+        # Only add if not already caught by DNS check
+        echo "$failed_services" | grep -q "dns" || {
+            failed_services="${failed_services}dnsmasq,"
+            critical_fail=1
+            attempt_fix_service "dnsmasq"
+        }
+    fi
+
+    # https-dns-proxy running
+    if ! pgrep "https-dns-proxy" >/dev/null 2>&1; then
+        failed_services="${failed_services}https-dns-proxy,"
+        non_critical_fail=1
+        attempt_fix_service "https-dns-proxy"
+    fi
+
+    # WAN interface — report only, NEVER restart (QMI modem safety)
+    local wan_status
+    wan_status=$(ifstatus wan 2>/dev/null)
+    if ! echo "$wan_status" | grep -q '"up": true'; then
+        failed_services="${failed_services}wan,"
+        critical_fail=1
+        log_msg "HEALTH: WAN interface down (report only — no auto-restart for QMI modem)"
+    fi
+
+    # LAN interface
+    local lan_status
+    lan_status=$(ifstatus lan 2>/dev/null)
+    if ! echo "$lan_status" | grep -q '"up": true'; then
+        failed_services="${failed_services}lan,"
+        critical_fail=1
+        attempt_fix_interface "lan"
+    fi
+
+    # IoT interface — report only, NEVER restart (sleeping devices are normal)
+    local iot_status
+    iot_status=$(ifstatus iot 2>/dev/null)
+    if ! echo "$iot_status" | grep -q '"up": true'; then
+        failed_services="${failed_services}iot,"
+        non_critical_fail=1
+        log_msg "HEALTH: IoT interface down (report only — no auto-restart)"
+    fi
+
+    # Firewall (nftables rules loaded)
+    local fw_chains
+    fw_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    if [ "$fw_chains" -le 5 ] 2>/dev/null; then
+        failed_services="${failed_services}firewall,"
+        critical_fail=1
+        attempt_fix_firewall
+    fi
+
+    # adblock-lean (non-critical — ad blocking, check blocklist exists)
+    if [ -f /etc/init.d/adblock-lean ]; then
+        if ! pgrep -f "adblock-lean" >/dev/null 2>&1 && \
+           ! [ -f /var/run/adblock-lean/abl-blocklist.gz ]; then
+            failed_services="${failed_services}adblock-lean,"
+            non_critical_fail=1
+            attempt_fix_service "adblock-lean"
+        fi
+    fi
+
+    # WiFi SSIDs — dynamically check all enabled wifi-iface sections
+    local wifi_info wifi_fix_attempted checked_ssids iface_disabled iface_ssid iface_network
+    wifi_info=$(iwinfo 2>/dev/null)
+    wifi_fix_attempted=0
+    checked_ssids=""
+    for iface in $(uci show wireless 2>/dev/null | grep '=wifi-iface' | cut -d'=' -f1 | cut -d'.' -f2); do
+        iface_disabled=$(uci -q get "wireless.${iface}.disabled")
+        # Skip disabled or deleted interfaces — not an error
+        [ "$iface_disabled" = "1" ] && continue
+        iface_ssid=$(uci -q get "wireless.${iface}.ssid")
+        [ -z "$iface_ssid" ] && continue
+        # Skip SSIDs already checked (multiple radios can share one SSID)
+        echo "$checked_ssids" | grep -q "|${iface_ssid}|" && continue
+        checked_ssids="${checked_ssids}|${iface_ssid}|"
+        iface_network=$(uci -q get "wireless.${iface}.network")
+        # Check if this SSID is broadcasting
+        if ! echo "$wifi_info" | grep -q "ESSID: \"${iface_ssid}\""; then
+            failed_services="${failed_services}wifi-${iface_ssid},"
+            if [ "$iface_network" = "lan" ]; then
+                critical_fail=1
+            else
+                non_critical_fail=1
+            fi
+            # Only attempt WiFi fix once per health check cycle
+            if [ "$wifi_fix_attempted" = "0" ]; then
+                wifi_fix_attempted=1
+                attempt_fix_wifi
+            fi
+        fi
+    done
+
+    # Remove trailing comma
+    failed_services=$(echo "$failed_services" | sed 's/,$//')
+
+    # Determine status
+    if [ "$critical_fail" = "1" ]; then
+        HEALTH_STATUS="FAILED"
+    elif [ "$non_critical_fail" = "1" ]; then
+        HEALTH_STATUS="DEGRADED"
+    else
+        HEALTH_STATUS="OK"
+    fi
+
+    HEALTH_FAILED_SERVICES="$failed_services"
+
+    # Write health context file
+    echo "${HEALTH_STATUS},${HEALTH_FAILED_SERVICES},$(epoch)" > /tmp/router-diag-health-context
+
+    log_msg "Health check: $HEALTH_STATUS${HEALTH_FAILED_SERVICES:+ (failed: $HEALTH_FAILED_SERVICES)}"
+}
+
+# ==========================================================
+# System Health (Temperature, Memory, Load)
+# ==========================================================
+
+# Protected processes — never kill these
+PROTECTED_PROCS="procd ubusd netifd dnsmasq dropbear rpcd uhttpd logd urngd hostapd wpa_supplicant router-diag"
+
+# Check system resource health and take action
+_handle_thermal_issue() {
+    local label="$1" temp="$2" threshold="$3" load="$4" level="$5"
+    local load_int
+    load_int=$(echo "$load" | cut -d'.' -f1)
+    load_int="${load_int:-0}"
+
+    if [ "$level" = "CRITICAL" ]; then
+        if [ "$load_int" -ge 1 ] 2>/dev/null; then
+            # High temp + high load — kill the heaviest non-protected process
+            attempt_kill_heavy_process "$temp" "$load"
+        else
+            # High temp but low load — hardware issue, just alert
+            log_msg "SYSTEM: CRITICAL temperature ${temp}C on $label (load ${load} — not process-related)"
+            send_email "[router-diag] CRITICAL TEMPERATURE — ${temp}C ($label)" \
+                "Router temperature has reached a critical level on $label.\n\nSensor: $label\nTemp: ${temp}C\nThreshold: ${threshold}C\nLoad: ${load}\n\nLoad is low so this is likely a hardware/ventilation issue, not a runaway process.\nCheck the router's physical environment — ensure adequate airflow.\n\nTime: $(timestamp)"
+        fi
+    else
+        log_msg "SYSTEM: Temperature warning ${temp}C on $label"
+        send_email "[router-diag] Temperature warning — ${temp}C ($label)" \
+            "Router temperature is elevated on $label.\n\nSensor: $label\nTemp: ${temp}C\nWarning: ${threshold}C\nLoad: ${load}\n\nMonitor closely. If it continues to rise, check ventilation.\n\nTime: $(timestamp)"
+    fi
+}
+
+check_system_health() {
+    # Read memory and load
+    local mem_free
+    mem_free=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -z "$mem_free" ] && mem_free=$(awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null)
+    mem_free="${mem_free:-0}"
+
+    local load
+    load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+    load="${load:-0}"
+
+    # --- Temperature checks ---
+    if [ -n "$SENSORS" ]; then
+        local s
+        for s in $SENSORS; do
+            local path label warn crit enabled
+            IFS='|' read -r path label warn crit enabled << SENSOR
+$s
+SENSOR
+            [ "$enabled" = "1" ] || continue
+            [ -f "$path" ] || continue
+
+            local t
+            t=$(cat "$path" 2>/dev/null)
+            [ -n "$t" ] && [ "$t" -gt 0 ] || continue
+            [ "$t" -gt 1000 ] && t=$((t / 1000))
+
+            if [ "$t" -ge "$crit" ] 2>/dev/null; then
+                _handle_thermal_issue "$label" "$t" "$crit" "$load" "CRITICAL"
+            elif [ "$t" -ge "$warn" ] 2>/dev/null; then
+                _handle_thermal_issue "$label" "$t" "$warn" "$load" "WARNING"
+            fi
+        done
+    else
+        # Fallback to legacy behavior if no sensors configured
+        local max_temp=0
+        local t_file
+        for t_file in /sys/class/hwmon/hwmon*/temp*_input /sys/class/thermal/thermal_zone*/temp; do
+            [ -f "$t_file" ] || continue
+            local val
+            val=$(cat "$t_file" 2>/dev/null)
+            [ -n "$val" ] && [ "$val" -gt 1000 ] && val=$((val / 1000))
+            [ "$val" -gt "$max_temp" ] 2>/dev/null && max_temp="$val"
+        done
+
+        if [ "$max_temp" -ge "$TEMP_CRITICAL" ] 2>/dev/null; then
+             _handle_thermal_issue "System" "$max_temp" "$TEMP_CRITICAL" "$load" "CRITICAL"
+        elif [ "$max_temp" -ge "$TEMP_WARNING" ] 2>/dev/null; then
+             _handle_thermal_issue "System" "$max_temp" "$TEMP_WARNING" "$load" "WARNING"
+        fi
+    fi
+
+    # --- Memory check ---
+    if [ "$mem_free" -le "$MEM_LOW_KB" ] 2>/dev/null && [ "$mem_free" -gt 0 ] 2>/dev/null; then
+        log_msg "SYSTEM: Low memory — ${mem_free}KB free"
+
+        # Find the biggest memory consumer
+        local top_proc
+        top_proc=$(ps w 2>/dev/null | awk 'NR>1{print $1}' | while read pid; do
+            local rss name
+            rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null)
+            name=$(cat "/proc/$pid/comm" 2>/dev/null)
+            [ -n "$rss" ] && [ -n "$name" ] && echo "$rss $pid $name"
+        done | sort -rn | head -5)
+
+        send_email "[router-diag] Low memory — ${mem_free}KB free" \
+            "Router is running low on memory.\n\nFree RAM: ${mem_free}KB (threshold: ${MEM_LOW_KB}KB)\nLoad: ${load}\nTemp: ${max_temp}C\n\nTop memory consumers:\n${top_proc}\n\nIf this persists, a service may be leaking memory. Consider restarting the heaviest service.\n\nTime: $(timestamp)"
+    fi
+}
+
+# Kill the heaviest non-protected process
+# Called when temperature is critical AND load is high
+attempt_kill_heavy_process() {
+    local temp="$1"
+    local load="$2"
+
+    if ! fix_attempt_allowed "kill-heavy"; then
+        log_err "Process kill attempts exhausted (2/hour max)"
+        send_email "[router-diag] CRITICAL TEMPERATURE ${temp}C — kill attempts exhausted" \
+            "Router temperature is critical and load is high, but process kill attempts have been exhausted (2 per hour).\n\nTemp: ${temp}C\nLoad: ${load}\n\nManual intervention required — SSH in and investigate.\n\nTime: $(timestamp)"
+        return 1
+    fi
+
+    # Find heaviest process by CPU, excluding protected ones
+    local protected_pattern
+    protected_pattern=$(echo "$PROTECTED_PROCS" | sed 's/ /\\|/g')
+
+    local heavy_proc
+    heavy_proc=$(ps w 2>/dev/null | awk 'NR>1{print $1}' | while read pid; do
+        local name
+        name=$(cat "/proc/$pid/comm" 2>/dev/null)
+        [ -n "$name" ] || continue
+        # Skip protected
+        echo "$name" | grep -qE "^($(echo "$PROTECTED_PROCS" | sed 's/ /|/g'))$" && continue
+        # Skip kernel threads
+        [ -f "/proc/$pid/cmdline" ] || continue
+        [ -s "/proc/$pid/cmdline" ] || continue
+        local cpu rss
+        cpu=$(awk '{total=$14+$15; print total}' "/proc/$pid/stat" 2>/dev/null)
+        rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        cpu="${cpu:-0}"
+        rss="${rss:-0}"
+        echo "$cpu $rss $pid $name"
+    done | sort -rn | head -1)
+
+    [ -n "$heavy_proc" ] || {
+        log_msg "SYSTEM: No killable process found"
+        send_email "[router-diag] CRITICAL TEMPERATURE ${temp}C — no killable process found" \
+            "Router temperature is critical (${temp}C) and load is high (${load}), but no non-protected process was found to kill.\n\nThis may be a hardware issue. Check ventilation.\n\nTime: $(timestamp)"
+        return 1
+    }
+
+    local cpu rss pid name
+    set -- $heavy_proc; cpu="$1"; rss="$2"; pid="$3"; name="$4"
+
+    local before_load="$load"
+    local before_temp="$temp"
+
+    log_msg "SYSTEM: Killing heavy process $name (PID $pid, RSS ${rss}KB) — temp ${temp}C, load ${load}"
+    kill "$pid" 2>/dev/null
+    sleep 3
+
+    # SIGKILL if still running
+    if [ -d "/proc/$pid" ]; then
+        kill -9 "$pid" 2>/dev/null
+        sleep 1
+    fi
+
+    local after_load
+    after_load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+    local after_alive="killed"
+    [ -d "/proc/$pid" ] && after_alive="STILL RUNNING"
+
+    send_email "[router-diag] CRITICAL TEMPERATURE ${temp}C — process killed" \
+        "Router temperature reached critical level with high load. A heavy process was killed.\n\nBefore:\n  Temperature: ${before_temp}C\n  Load: ${before_load}\n\nProcess killed:\n  Name: $name\n  PID: $pid\n  Memory: ${rss}KB RSS\n  Status: $after_alive\n\nAfter:\n  Load: ${after_load}\n\nIf the process is needed, restart it manually. If this keeps happening, investigate why $name is consuming excessive resources.\n\nTime: $(timestamp)"
+}
+
+# ==========================================================
+# Network Conflict Detection
+# ==========================================================
+
+# Get known static IPs (router interfaces + UCI static leases)
+# These are excluded from "rogue static" detection
+get_known_statics() {
+    # Router's own IPs
+    echo "192.168.1.1"
+    echo "192.168.30.1"
+
+    # UCI static DHCP leases (config host entries)
+    local ip
+    for ip in $(uci -q show dhcp | grep "\.ip=" | sed "s/.*='\(.*\)'/\1/"); do
+        echo "$ip"
+    done
+}
+
+# Detect and handle network conflicts
+# Runs each cycle after health check
+# Writes results to /tmp/router-diag-conflicts for the analysis prompt
+check_network_conflicts() {
+    local issues=""
+    local issue_count=0
+    local fixed_count=0
+
+    # Build known statics list
+    local known_statics
+    known_statics=$(get_known_statics)
+
+    # Build DHCP lease lookup (ip -> mac hostname)
+    local lease_file="/tmp/dhcp.leases"
+    local lease_ips=""
+    if [ -f "$lease_file" ] && [ -s "$lease_file" ]; then
+        lease_ips=$(awk '{print $3}' "$lease_file")
+    fi
+
+    # Get ARP table (exclude incomplete entries)
+    local arp_table
+    arp_table=$(ip neigh show 2>/dev/null | grep -v "FAILED\|INCOMPLETE")
+
+    [ -n "$arp_table" ] || {
+        echo "No conflicts detected" > /tmp/router-diag-conflicts
+        return
+    }
+
+    # --- Check 1: IP conflicts (same IP, different MACs) ---
+    local conflict_ips
+    conflict_ips=$(echo "$arp_table" | awk '{print $1}' | sort | uniq -d)
+
+    local cip
+    for cip in $conflict_ips; do
+        local macs
+        macs=$(echo "$arp_table" | awk -v ip="$cip" '$1 == ip {print $5}' | sort -u)
+        local mac_count
+        mac_count=$(echo "$macs" | wc -l)
+
+        if [ "$mac_count" -gt 1 ]; then
+            issue_count=$((issue_count + 1))
+            local mac_list
+            mac_list=$(echo "$macs" | tr '\n' ' ')
+
+            # Check if one is a DHCP client — we can fix that
+            local dhcp_mac=""
+            local static_mac=""
+            local m
+            for m in $mac_list; do
+                if [ -f "$lease_file" ] && grep -q "$m" "$lease_file" 2>/dev/null; then
+                    dhcp_mac="$m"
+                else
+                    static_mac="$m"
+                fi
+            done
+
+            if [ -n "$dhcp_mac" ] && [ -n "$static_mac" ]; then
+                # Auto-fix: remove DHCP lease for conflicting client, flush ARP, signal dnsmasq
+                local hostname
+                hostname=$(awk -v mac="$dhcp_mac" '$2 == mac {print $4}' "$lease_file" 2>/dev/null)
+                hostname="${hostname:-unknown}"
+
+                sed -i "/$dhcp_mac/d" "$lease_file" 2>/dev/null
+                ip neigh del "$cip" dev br-lan 2>/dev/null
+                ip neigh del "$cip" dev br-iot 2>/dev/null
+                kill -HUP "$(pidof dnsmasq)" 2>/dev/null
+
+                fixed_count=$((fixed_count + 1))
+                issues="${issues}IP CONFLICT [AUTO-FIXED]: $cip claimed by MACs: ${mac_list}\n"
+                issues="${issues}  -> Removed DHCP lease for $hostname ($dhcp_mac), flushed ARP, signalled dnsmasq to reassign\n"
+
+                log_msg "CONFLICT-FIX: IP $cip conflict — removed lease for $dhcp_mac ($hostname), flushed ARP"
+                send_email "[router-diag] Auto-fix applied — IP conflict resolved" \
+                    "IP conflict detected and resolved.\n\nConflicting IP: $cip\nMACs involved: ${mac_list}\n\nAction taken:\n- Removed DHCP lease for $hostname ($dhcp_mac)\n- Flushed ARP entry for $cip\n- Signalled dnsmasq to reassign new IP on next request\n\nThe static device ($static_mac) keeps $cip.\nThe DHCP client ($hostname) will get a new IP automatically.\n\nTime: $(timestamp)"
+            else
+                # Both static or both DHCP — can't safely auto-fix
+                issues="${issues}IP CONFLICT [NEEDS ATTENTION]: $cip claimed by MACs: ${mac_list}\n"
+                issues="${issues}  -> Both devices appear to use static IPs — manual resolution required\n"
+
+                log_msg "CONFLICT: IP $cip conflict between MACs: ${mac_list} — manual fix needed"
+                send_email "[router-diag] IP conflict detected — manual fix needed" \
+                    "IP conflict detected that cannot be auto-resolved.\n\nConflicting IP: $cip\nMACs involved: ${mac_list}\n\nBoth devices appear to have static/fixed IPs. One needs to be reconfigured manually.\n\nTime: $(timestamp)"
+            fi
+        fi
+    done
+
+    # --- Check 2: Duplicate MACs (same MAC, different IPs) ---
+    local dup_macs
+    dup_macs=$(echo "$arp_table" | awk '{print $5}' | sort | uniq -d)
+
+    local dmac
+    for dmac in $dup_macs; do
+        [ -n "$dmac" ] || continue
+        local dup_ips
+        dup_ips=$(echo "$arp_table" | awk -v mac="$dmac" '$5 == mac {print $1}' | sort -u)
+        local ip_count
+        ip_count=$(echo "$dup_ips" | wc -l)
+
+        if [ "$ip_count" -gt 1 ]; then
+            local ip_list
+            ip_list=$(echo "$dup_ips" | tr '\n' ' ')
+
+            # Check if IPs span subnets (normal for router) vs same subnet (problem)
+            local lan_count=0 iot_count=0
+            local dip
+            for dip in $ip_list; do
+                case "$dip" in
+                    192.168.30.*) iot_count=$((iot_count + 1)) ;;
+                    192.168.1.*) lan_count=$((lan_count + 1)) ;;
+                esac
+            done
+
+            # Multiple IPs on same subnet = actual issue
+            if [ "$lan_count" -gt 1 ] || [ "$iot_count" -gt 1 ]; then
+                issue_count=$((issue_count + 1))
+                local hostname
+                hostname=$(awk -v mac="$dmac" '$2 == mac {print $4}' "$lease_file" 2>/dev/null | head -1)
+                hostname="${hostname:-unknown}"
+
+                issues="${issues}DUPLICATE MAC [NEEDS ATTENTION]: $dmac (${hostname}) has multiple IPs on same subnet: ${ip_list}\n"
+                issues="${issues}  -> Possible misconfigured device, VM, or MAC spoofing\n"
+
+                log_msg "CONFLICT: MAC $dmac ($hostname) has multiple same-subnet IPs: $ip_list"
+                send_email "[router-diag] Duplicate MAC detected — $hostname" \
+                    "A device MAC address has multiple IPs on the same subnet.\n\nMAC: $dmac\nHostname: $hostname\nIPs: ${ip_list}\n\nThis usually indicates a misconfigured device, VM bridging issue, or MAC spoofing.\nManual investigation required.\n\nTime: $(timestamp)"
+            fi
+        fi
+    done
+
+    # --- Check 3: Rogue statics (in ARP but not in DHCP leases or known statics) ---
+    local arp_ips
+    arp_ips=$(echo "$arp_table" | awk '{print $1}' | sort -u)
+
+    local aip
+    for aip in $arp_ips; do
+        # Skip if known static
+        echo "$known_statics" | grep -qx "$aip" && continue
+
+        # Skip if in DHCP leases
+        echo "$lease_ips" | grep -qx "$aip" && continue
+
+        # Skip link-local, CGNAT (100.64.0.0/10), multicast, broadcast, and all IPv6 (SLAAC addresses are normal, not rogues)
+        case "$aip" in
+            169.254.*|100.*|224.*|239.*|255.*|ff0*|fe80:*|fd*:*|::1|*:*) continue ;;
+        esac
+
+        # This IP is in ARP but not DHCP and not a known static
+        local rogue_mac
+        rogue_mac=$(echo "$arp_table" | awk -v ip="$aip" '$1 == ip {print $5}' | head -1)
+
+        # Check if it's in the DHCP range (could be expired lease still in ARP)
+        local in_range=0
+        case "$aip" in
+            192.168.1.*)
+                local last_octet
+                last_octet=$(echo "$aip" | cut -d'.' -f4)
+                [ "$last_octet" -ge 100 ] && [ "$last_octet" -le 250 ] 2>/dev/null && in_range=1
+                ;;
+            192.168.30.*)
+                local last_octet
+                last_octet=$(echo "$aip" | cut -d'.' -f4)
+                [ "$last_octet" -ge 100 ] && [ "$last_octet" -le 250 ] 2>/dev/null && in_range=1
+                ;;
+        esac
+
+        if [ "$in_range" = "1" ]; then
+            # In DHCP range but no lease — probably expired ARP entry, not alarming
+            continue
+        fi
+
+        # Outside DHCP range and not a known static — flag it
+        issue_count=$((issue_count + 1))
+        issues="${issues}ROGUE STATIC [NEEDS ATTENTION]: $aip ($rogue_mac) — not in DHCP leases or known statics\n"
+        issues="${issues}  -> Device is using a static IP outside the DHCP range. Verify this is intentional.\n"
+
+        log_msg "CONFLICT: Rogue static IP $aip ($rogue_mac) — not in DHCP or known statics"
+        send_email "[router-diag] Unknown static IP detected" \
+            "A device is using a static IP that is not in DHCP leases or known static reservations.\n\nIP: $aip\nMAC: $rogue_mac\n\nThis device is outside the DHCP range and is not a recognised static assignment.\nVerify this is intentional — if not, the device should be reconfigured to use DHCP.\n\nTime: $(timestamp)"
+    done
+
+    # Write summary for Gemini prompt
+    if [ "$issue_count" -gt 0 ]; then
+        printf "Issues: %d (auto-fixed: %d)\n%b" "$issue_count" "$fixed_count" "$issues" > /tmp/router-diag-conflicts
+    else
+        echo "No conflicts detected" > /tmp/router-diag-conflicts
+    fi
+}
+
+# ==========================================================
+# WiFi Thrash Detection
+# ==========================================================
+
+THRASH_THRESHOLD=5          # association events per cycle = thrashing
+THRASH_NOTIFY_COOLDOWN=3600 # don't re-notify about the same device within 1 hour
+THRASH_WHITELIST_FILE="/etc/router-diag-thrash-whitelist" # one MAC per line, lowercase — PIR bulbs etc that cycle by design
+
+# Detect devices rapidly associating/disassociating with the AP
+# Notification only — no blocking, no deauth, no interface restarts
+# IoT devices cycle on/off frequently; blocking causes worse disruption
+check_wifi_thrashing() {
+    local marker_file="/tmp/router-diag-thrash-marker"
+    local notified_file="/tmp/router-diag-thrash-notified"
+    local summary_file="/tmp/router-diag-thrash-status"
+    local now
+    now=$(epoch)
+
+    # --- Clean up stale notification cooldowns ---
+    if [ -f "$notified_file" ]; then
+        local keep_notified=""
+        while read -r nmac ntime; do
+            [ -n "$nmac" ] || continue
+            local elapsed=$((now - ntime))
+            if [ "$elapsed" -lt "$THRASH_NOTIFY_COOLDOWN" ]; then
+                keep_notified="${keep_notified}${nmac} ${ntime}\n"
+            fi
+        done < "$notified_file"
+        if [ -n "$keep_notified" ]; then
+            printf '%b' "$keep_notified" > "$notified_file"
+        else
+            rm -f "$notified_file"
+        fi
+    fi
+
+    # --- Clean up legacy blocked-macs file from old version ---
+    rm -f "/tmp/router-diag-blocked-macs"
+
+    # --- Count new association events since last check ---
+    local current_log
+    current_log=$(logread 2>/dev/null | grep "hostapd:" | grep -iE "associat|deauthenticat")
+
+    local current_count
+    current_count=$(echo "$current_log" | grep -c "" 2>/dev/null || echo "0")
+
+    local prev_count=0
+    [ -f "$marker_file" ] && prev_count=$(cat "$marker_file" 2>/dev/null)
+
+    echo "$current_count" > "$marker_file"
+
+    local new_count=$((current_count - prev_count))
+
+    # Log wrapped or no new events
+    if [ "$new_count" -le 0 ]; then
+        [ -f "$summary_file" ] || echo "No thrashing detected" > "$summary_file"
+        return
+    fi
+
+    # Get only the new log lines and extract MACs with event counts
+    local new_events
+    new_events=$(echo "$current_log" | tail -n "$new_count")
+
+    local thrash_macs
+    thrash_macs=$(echo "$new_events" | grep -oE 'STA [0-9a-fA-F:]{17}' | awk '{print $2}' | sort | uniq -c | sort -rn)
+
+    local status_msg=""
+
+    echo "$thrash_macs" | while read -r count mac; do
+        [ -n "$mac" ] || continue
+        [ "$count" -gt "$THRASH_THRESHOLD" ] || continue
+
+        # Skip whitelisted devices (PIR bulbs etc that cycle by design)
+        local mac_lower
+        mac_lower=$(echo "$mac" | tr 'A-Z' 'a-z')
+        [ -f "$THRASH_WHITELIST_FILE" ] && grep -q "$mac_lower" "$THRASH_WHITELIST_FILE" && continue
+
+        # Skip if already notified within cooldown period
+        [ -f "$notified_file" ] && grep -q "$mac" "$notified_file" && continue
+
+        # Look up hostname from DHCP leases
+        local hostname
+        hostname=$(awk -v m="$mac" 'tolower($2) == tolower(m) {print $4}' /tmp/dhcp.leases 2>/dev/null | head -1)
+        hostname="${hostname:-unknown}"
+
+        # Find which interface it's on
+        local iface
+        iface=$(echo "$new_events" | grep -i "$mac" | grep -oE 'wlan[0-9][-_]?[0-9]*' | tail -1)
+        iface="${iface:-unknown}"
+
+        # Record notification to prevent spam
+        echo "$mac $now" >> "$notified_file"
+
+        log_msg "THRASH-DETECTED: $mac ($hostname) — $count association events in one cycle (threshold: $THRASH_THRESHOLD) on $iface"
+
+        send_email "[router-diag] WiFi thrashing detected — $hostname" \
+            "A device is repeatedly connecting/disconnecting.\n\nDevice: $hostname\nMAC: $mac\nInterface: $iface\nAssociation events this cycle: $count (threshold: $THRASH_THRESHOLD)\n\nNo automatic action has been taken.\n\nTo manually block this device:\n  hostapd_cli -i $iface deny_acl ADD $mac\n  hostapd_cli -i $iface deauthenticate $mac\n\nTo manually unblock:\n  hostapd_cli -i $iface deny_acl DEL $mac\n\nYou will not be notified about this device again for $(( THRASH_NOTIFY_COOLDOWN / 60 )) minutes.\n\nTime: $(timestamp)"
+
+        status_msg="${status_msg}THRASHING: $mac ($hostname) — $count events on $iface (notified)\n"
+    done
+
+    if [ -n "$status_msg" ]; then
+        printf "Thrashing detected (notification only):\n%b" "$status_msg" > "$summary_file"
+    else
+        echo "No thrashing detected" > "$summary_file"
+    fi
+}
+
+# ==========================================================
+# Daemon
+# ==========================================================
+
+check_triggers() {
+    local metrics="$1"
+
+    # Parse relevant fields
+    local ts rsrp rsrq rssi snr lat rest
+    IFS=',' read ts rsrp rsrq rssi snr lat rest << METRICS
+$metrics
+METRICS
+
+    local triggers=""
+
+    # Latency threshold
+    if [ -n "$lat" ] && [ "$lat" != "9999" ]; then
+        local lat_int=$(echo "$lat" | cut -d'.' -f1)
+        if [ "$lat_int" -gt "$TRIGGER_LATENCY" ] 2>/dev/null; then
+            triggers="${triggers}high_latency(${lat}ms) "
+        fi
+    fi
+
+    echo "$triggers"
+}
+
+daemon_loop() {
+    log_msg "Daemon started"
+
+    local last_api_call=0
+    local fix_settle_delay=120  # skip analysis for 2 min after any auto-fix
+    local last_hourly_check
+    last_hourly_check=$(epoch)
+    local collect_count=0
+    local warmup_cycles=3
+    local consecutive_degraded=0
+    local last_degraded_email=0
+    HEALTH_STATUS="OK"
+    HEALTH_FAILED_SERVICES=""
+
+    log_msg "Warmup: collecting $warmup_cycles cycles before allowing analysis"
+
+    while true; do
+        local now
+        now=$(epoch)
+
+        # 1. Collect metrics
+        local metrics
+        metrics=$(collect_all_metrics)
+
+        if [ -n "$metrics" ]; then
+            echo "$metrics" >> "$METRICS_FILE"
+            collect_count=$((collect_count + 1))
+        fi
+
+        # 1b. Cache logread (single read per cycle, used by triggers and prompt)
+        cache_logread
+
+        # 2. Network health check (detect + auto-fix)
+        check_network_health
+
+        # 3. System health (temperature, memory, load)
+        check_system_health
+
+        # 4. Network conflict detection (IP conflicts, rogue statics, duplicate MACs)
+        check_network_conflicts
+
+        # 5. WiFi thrash detection (rapid association/disassociation)
+        check_wifi_thrashing
+
+        # Track consecutive DEGRADED cycles
+        if [ "$HEALTH_STATUS" = "DEGRADED" ]; then
+            consecutive_degraded=$((consecutive_degraded + 1))
+        else
+            consecutive_degraded=0
+        fi
+
+        # 6. Check if we should run analysis
+        #    Skip analysis during warmup (first N cycles = unreliable data)
+        local should_analyze=0
+        local trigger_reason=""
+
+        if [ "$collect_count" -lt "$warmup_cycles" ]; then
+            sleep "$COLLECT_INTERVAL"
+            continue
+        fi
+
+        # Check latency triggers
+        local triggers
+        triggers=$(check_triggers "$metrics")
+        if [ -n "$triggers" ]; then
+            trigger_reason="trigger: $triggers"
+            should_analyze=1
+        fi
+
+        # Health-based triggers
+        if [ "$HEALTH_STATUS" = "FAILED" ]; then
+            if [ -z "$trigger_reason" ]; then
+                trigger_reason="network_health_failed: $HEALTH_FAILED_SERVICES"
+            else
+                trigger_reason="${trigger_reason}+ network_health_failed: $HEALTH_FAILED_SERVICES"
+            fi
+            should_analyze=1
+        elif [ "$HEALTH_STATUS" = "DEGRADED" ] && [ "$consecutive_degraded" -ge 2 ]; then
+            if [ -z "$trigger_reason" ]; then
+                trigger_reason="network_health_degraded_persistent: $HEALTH_FAILED_SERVICES"
+            else
+                trigger_reason="${trigger_reason}+ network_health_degraded_persistent: $HEALTH_FAILED_SERVICES"
+            fi
+            should_analyze=1
+            # Only email once per 30 cycles (~1 hour) to avoid spam
+            if [ $((consecutive_degraded - last_degraded_email)) -ge 30 ] || [ "$last_degraded_email" = "0" ]; then
+                send_email "[router-diag] Persistent DEGRADED status" \
+                    "Network health has been DEGRADED for $consecutive_degraded consecutive cycles.\n\nFailed services: $HEALTH_FAILED_SERVICES\nTime: $(timestamp)"
+                last_degraded_email=$consecutive_degraded
+            fi
+        fi
+
+        # Log-based triggers (scan system logs for errors)
+        local log_triggers
+        log_triggers=$(check_log_triggers)
+        if [ -n "$log_triggers" ]; then
+            if [ -z "$trigger_reason" ]; then
+                trigger_reason="log_errors: $log_triggers"
+            else
+                trigger_reason="${trigger_reason}+ log_errors: $log_triggers"
+            fi
+            should_analyze=1
+        fi
+
+        # Scheduled check — only if something is worth analysing
+        # If everything is healthy and logs are clean, extend to every 6 hours
+        # If there are active issues or recent fixes, keep hourly
+        if [ "$TRIGGER_HOURLY" = "1" ]; then
+            local hourly_elapsed=$((now - last_hourly_check))
+            local scheduled_interval=21600  # 6 hours default
+            # Drop to hourly if health isn't perfect or there are active fix trackers
+            if [ "$HEALTH_STATUS" != "OK" ] || [ -n "$(ls /tmp/router-diag-fix-* 2>/dev/null)" ]; then
+                scheduled_interval=3600  # 1 hour when issues exist
+            fi
+            if [ "$hourly_elapsed" -ge "$scheduled_interval" ]; then
+                if [ -z "$trigger_reason" ]; then
+                    trigger_reason="scheduled_check"
+                else
+                    trigger_reason="${trigger_reason}+ scheduled"
+                fi
+                should_analyze=1
+                last_hourly_check="$now"
+            fi
+        fi
+
+        # Settle delay — skip analysis if a fix was just applied (let it take effect)
+        if [ "$should_analyze" = "1" ] && [ -f /tmp/router-diag-last-fix ]; then
+            local last_fix_epoch
+            last_fix_epoch=$(cat /tmp/router-diag-last-fix 2>/dev/null)
+            if [ -n "$last_fix_epoch" ]; then
+                local fix_ago=$((now - last_fix_epoch))
+                if [ "$fix_ago" -lt "$fix_settle_delay" ]; then
+                    local fix_wait=$((fix_settle_delay - fix_ago))
+                    log_msg "Analysis deferred — fix applied ${fix_ago}s ago, settling for ${fix_wait}s more"
+                    should_analyze=0
+                fi
+            fi
+        fi
+
+        # Rate limiting
+        if [ "$should_analyze" = "1" ]; then
+            local api_elapsed=$((now - last_api_call))
+            if [ "$api_elapsed" -lt "$API_COOLDOWN" ]; then
+                local wait=$((API_COOLDOWN - api_elapsed))
+                log_msg "Analysis triggered ($trigger_reason) but rate limited. ${wait}s until next allowed."
+                should_analyze=0
+            fi
+        fi
+
+        # 7. Run analysis if triggered
+        if [ "$should_analyze" = "1" ]; then
+            run_analysis "$metrics" "$trigger_reason" > /dev/null
+            last_api_call=$(epoch)
+        fi
+
+        # Rotate metrics periodically (every ~100 collections)
+        if [ $((collect_count % 100)) -eq 0 ] && [ "$collect_count" -gt 0 ]; then
+            rotate_metrics
+        fi
+
+        sleep "$COLLECT_INTERVAL"
+    done
+}
+
+cmd_start() {
+    mount_usb || die "USB not available"
+    load_config || die "Not configured. Run '$PROG setup' first."
+    [ -n "$GEMINI_API_KEY" ] || die "No API key. Run '$PROG setup' first."
+
+    # Check if already running — both PID file and process scan
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        die "Already running (PID $(cat "$PID_FILE")). Use '$PROG stop' first."
+    fi
+
+    # Kill any stale daemon by PID file (if process exists but didn't respond above)
+    if [ -f "$PID_FILE" ]; then
+        local stale_pid
+        stale_pid=$(cat "$PID_FILE")
+        if [ -n "$stale_pid" ] && kill -0 "$stale_pid" 2>/dev/null; then
+            log_msg "Killing stale daemon (PID $stale_pid)"
+            kill "$stale_pid" 2>/dev/null
+            sleep 1
+            kill -0 "$stale_pid" 2>/dev/null && kill -9 "$stale_pid" 2>/dev/null
+        fi
+    fi
+    rm -f "$PID_FILE" "$LOCK_FILE"
+
+    log_msg "Starting daemon..."
+    # Detach properly so daemon survives parent shell/SSH exit
+    ( daemon_loop ) </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    log_msg "Daemon started (PID $pid)"
+    echo "router-diag daemon started (PID $pid)"
+}
+
+cmd_stop() {
+    local stopped=0
+
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid"
+            log_msg "Daemon stopped (PID $pid)"
+            stopped=1
+        fi
+    fi
+
+    # Fallback: kill any remaining instances by process name
+    local stale_pids
+    stale_pids=$(pgrep -f "router-diag start" 2>/dev/null)
+    if [ -n "$stale_pids" ]; then
+        echo "$stale_pids" | xargs kill 2>/dev/null
+        sleep 1
+        stale_pids=$(pgrep -f "router-diag start" 2>/dev/null)
+        [ -n "$stale_pids" ] && echo "$stale_pids" | xargs kill -9 2>/dev/null
+        [ "$stopped" = "0" ] && log_msg "Killed stale router-diag instance(s)"
+        stopped=1
+    fi
+
+    rm -f "$PID_FILE" "$LOCK_FILE"
+
+    if [ "$stopped" = "1" ]; then
+        echo "router-diag daemon stopped"
+    else
+        echo "Not running"
+    fi
+}
+
+# ==========================================================
+# Main CLI
+# ==========================================================
+
+usage() {
+    cat << USAGE
+router-diag v$VERSION — AI-Powered Router Diagnostics
+
+Usage: $PROG <command> [args]
+
+Commands:
+  setup              First-time setup (USB, API key, config)
+  start              Start the monitoring daemon
+  stop               Stop the monitoring daemon
+  status             Show live metrics and daemon status
+  analyze            Run manual Gemini analysis
+  history [N]        Show last N metric readings (default: 20)
+  log [N|all]        Show last N analysis results (default: 1)
+  config             Show all configuration
+  config <key>       Show a config value
+  config <key> <val> Set a config value
+
+Config keys:
+  api_key, model, interval, latency,
+  hourly, cooldown, email_to, email_from, email_app_password,
+  email_enabled
+
+Examples:
+  $PROG setup                    # First-time setup
+  $PROG status                   # Quick health check
+  $PROG analyze                  # Manual AI analysis
+  $PROG config email_enabled 1   # Enable email notifications
+  $PROG config latency 200       # Set latency threshold
+USAGE
+}
+
+# --- Entry Point ---
+case "${1:-}" in
+    setup)
+        cmd_setup
+        ;;
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    status)
+        cmd_status
+        ;;
+    analyze)
+        cmd_analyze
+        ;;
+    history)
+        cmd_history "$2"
+        ;;
+    log)
+        cmd_log "$2"
+        ;;
+    config)
+        shift
+        cmd_config "$@"
+        ;;
+    luci-json)
+        cmd_luci_json
+        ;;
+    version|-v|--version)
+        echo "$PROG v$VERSION"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac

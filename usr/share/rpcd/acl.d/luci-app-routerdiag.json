@@ -1,0 +1,15 @@
+{
+	"luci-app-routerdiag": {
+		"description": "Grant access to Router Diagnostics",
+		"read": {
+			"file": {
+				"/usr/bin/router-diag": ["exec"]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/router-diag": ["exec"]
+			}
+		}
+	}
+}
