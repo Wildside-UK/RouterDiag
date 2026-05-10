@@ -1,0 +1,9 @@
+pkgname = luci-app-routerdiag
+pkgver = 0.9.1a-r1
+pkgdesc = AI-Powered Router Diagnostics for OpenWrt
+url = https://github.com/Wildside-UK/RouterDiag
+builddate = 1778421997
+packager = Steve Meek
+size = 143553
+arch = aarch64_cortex-a53
+depend = sms_tool msmtp curl ca-bundle

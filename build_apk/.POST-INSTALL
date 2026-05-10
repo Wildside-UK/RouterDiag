@@ -1,0 +1,3 @@
+#!/bin/sh
+[ -f /etc/init.d/router-diag ] && /etc/init.d/router-diag enable
+exit 0
