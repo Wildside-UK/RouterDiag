@@ -38,7 +38,7 @@ REBOOT_TIMEOUT_MIN=30       # Minutes without internet before Level 4 reboot
 
 # --- Defaults (overridden by config) ---
 GEMINI_API_KEY=""
-GEMINI_MODEL="gemini-2.5-flash"
+GEMINI_MODEL="gemini-3.1-flash-lite-latest"
 WEATHER_API_KEY=""
 LOCATION_LAT="52.2433"
 LOCATION_LON="-2.2233"
@@ -891,50 +891,34 @@ collect_latency() {
     done
     echo "9999"
 }
-
 collect_throughput() {
-    # Returns: dl_bytes ul_bytes (delta since last call)
-    # Uses /proc/net/dev for the WAN interface (wwan0 typically)
     local iface=$(uci -q get network.${MODEM_IFACE}.l3_device || echo "rmnet_mhi0.1")
-    local stats
-    stats=$(grep "$iface" /proc/net/dev 2>/dev/null | tr -s ' ')
+    local stats=$(grep "$iface" /proc/net/dev 2>/dev/null)
+    [ -z "$stats" ] && { echo "0 0"; return; }
 
-    if [ -z "$stats" ]; then
-        echo "0 0"
-        return
-    fi
+    # Robust parsing: Find interface name, next field is RX, +9 fields is TX
+    local rx_bytes=$(echo "$stats" | awk -v iface="$iface" -F'[: ]+' '{for(i=1;i<=NF;i++) if($i==iface) {print $(i+1); break}}')
+    local tx_bytes=$(echo "$stats" | awk -v iface="$iface" -F'[: ]+' '{for(i=1;i<=NF;i++) if($i==iface) {print $(i+9); break}}')
 
-    local rx_bytes tx_bytes
-    rx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $3}')
-    tx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $11}')
-
-    # Guard: ensure integer values (empty/malformed → 0)
     case "$rx_bytes" in ''|*[!0-9]*) rx_bytes=0 ;; esac
     case "$tx_bytes" in ''|*[!0-9]*) tx_bytes=0 ;; esac
 
-    # Store in temp file for delta calculation
     local prev_file="/tmp/router-diag-throughput"
     if [ -f "$prev_file" ]; then
-        local prev_rx prev_tx prev_time
+        local prev_rx prev_tx prev_time now
         read prev_rx prev_tx prev_time < "$prev_file"
-        local now_time
-        now_time=$(epoch)
-        local delta_t=$((now_time - prev_time))
-        if [ "$delta_t" -gt 0 ]; then
-            local dl=$((rx_bytes - prev_rx))
-            local ul=$((tx_bytes - prev_tx))
-            # Handle counter wrap
-            [ "$dl" -lt 0 ] && dl=0
-            [ "$ul" -lt 0 ] && ul=0
-            echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
-            echo "$dl $ul"
-            return
-        fi
+        now=$(date +%s)
+        local diff_rx=$((rx_bytes - prev_rx))
+        local diff_tx=$((tx_bytes - prev_tx))
+        [ $diff_rx -lt 0 ] && diff_rx=0
+        [ $diff_tx -lt 0 ] && diff_tx=0
+        echo "$diff_rx $diff_tx"
+    else
+        echo "0 0"
     fi
-
-    echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
-    echo "0 0"
+    echo "$rx_bytes $tx_bytes $(date +%s)" > "$prev_file"
 }
+
 
 collect_system() {
     # Returns: load_1m mem_free_kb sensor1_val sensor2_val ...
@@ -1424,7 +1408,7 @@ cmd_luci_json() {
         last_mem=$(echo "$sys" | awk '{print $2}')
         # Sensors values are from field 3 onwards
         local sensor_vals
-        sensor_vals=$(echo "$sys" | cut -d' ' -f3- | tr ' ' ',')
+        sensor_vals=$(echo "$sys" | cut -d' ' -f3- | tr ' ' ',' | sed 's/^,//')
     fi
 
     # --- Health status ---
@@ -1551,6 +1535,8 @@ cmd_luci_json() {
     "email_enabled": "$EMAIL_ENABLED",
     "email_to": "$EMAIL_TO",
     "collect_interval": "$COLLECT_INTERVAL",
+    "gemini_api_key": "$([ -n "$GEMINI_API_KEY" ] && echo "Configured" || echo "")",
+    "gemini_model": "$GEMINI_MODEL",
     "metrics_path": "$METRICS_PATH",
     "metrics_max_size": "$MAX_FILE_SIZE_MB",
     "sensors": "$SENSORS",
@@ -3228,8 +3214,13 @@ Commands:
 
 Config keys:
   api_key, model, interval, latency,
-  hourly, cooldown, email_to, email_from, email_app_password,
-  email_enabled
+  rsrp, rsrp_base, snr_base, services,
+  hourly, cooldown, email_to, email_from, 
+  email_app_password, email_enabled,
+  flash_safe, sync_records,
+  metrics_path, metrics_max_size,
+  lat, lon, weather_api_key, self_heal,
+  model_name, site_type
 
 Examples:
   $PROG setup                    # First-time setup

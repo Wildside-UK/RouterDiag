@@ -38,7 +38,7 @@ REBOOT_TIMEOUT_MIN=30       # Minutes without internet before Level 4 reboot
 
 # --- Defaults (overridden by config) ---
 GEMINI_API_KEY=""
-GEMINI_MODEL="gemini-2.5-flash"
+GEMINI_MODEL="gemini-3.1-flash-lite-latest"
 WEATHER_API_KEY=""
 LOCATION_LAT="52.2433"
 LOCATION_LON="-2.2233"
@@ -730,20 +730,31 @@ collect_weather() {
 
 collect_bands() {
     # Returns: current band info (e.g., "B1 (PCC) + B3 (SCC)")
-    local raw
-    raw=$(at_cmd 'AT+ZCAINFO?')
-    [ -n "$raw" ] || return
+    local raw bands=""
 
-    # Parse AT+ZCAINFO? output
-    # Example format: +ZCAINFO: PCC,earfcn,band,pci,bandwidth...
-    local bands
-    bands=$(echo "$raw" | grep "+ZCAINFO:" | sed 's/+ZCAINFO: //' | awk -F',' '{
-        type=$1; band=$3;
-        if(type=="PCC") printf "%s (PCC) ", band;
-        else if(type=="SCC") printf "+ %s (SCC) ", band;
-    }' | sed 's/ $//')
+    # Try ZTE Format (AT+ZCAINFO?)
+    raw=$(at_cmd 'AT+ZCAINFO?' 2>/dev/null)
+    if echo "$raw" | grep -q "+ZCAINFO:"; then
+        bands=$(echo "$raw" | grep "+ZCAINFO:" | sed 's/+ZCAINFO: //' | awk -F',' '{
+            type=$1; band=$3;
+            if(type=="PCC") printf "%s (PCC) ", band;
+            else if(type=="SCC") printf "+ %s (SCC) ", band;
+        }')
+    else
+        # Try Quectel Format (AT+QCAINFO)
+        # Returns: +QCAINFO: "PCC",earfcn,bandwidth,"LTE BAND X",...
+        raw=$(at_cmd 'AT+QCAINFO' 2>/dev/null)
+        if echo "$raw" | grep -q "+QCAINFO:"; then
+            bands=$(echo "$raw" | grep "+QCAINFO:" | sed 's/+QCAINFO: //' | awk -F',' '{
+                type=$1; gsub(/"/,"",type);
+                band=$4; gsub(/"/,"",band); gsub(/LTE BAND /,"B",band);
+                if(type=="PCC") printf "%s (PCC) ", band;
+                else if(type=="SCC") printf "+ %s (SCC) ", band;
+            }')
+        fi
+    fi
 
-    echo "${bands:-Unknown}"
+    echo "${bands:-Unknown}" | sed 's/ $//'
 }
 
 # --- Self-Healing Registry ---
@@ -828,18 +839,38 @@ PROMPT
 
 collect_signal() {
     # Returns: rsrp rsrq rssi snr
-    # AT+ZRSSI returns: +ZRSSI: rsrp,rsrq,rssi,snr (e.g., +ZRSSI: -96,-8,-71,19.2)
-    local raw
-    raw=$(at_cmd 'AT+ZRSSI')
+    local raw rsrp="0" rsrq="0" rssi="0" snr="0"
 
-    local values
-    values=$(echo "$raw" | grep '+ZRSSI:' | sed 's/.*+ZRSSI:[[:space:]]*//' | tr -d ' \r')
-
-    local rsrp rsrq rssi snr
-    rsrp=$(echo "$values" | cut -d',' -f1)
-    rsrq=$(echo "$values" | cut -d',' -f2)
-    rssi=$(echo "$values" | cut -d',' -f3)
-    snr=$(echo "$values" | cut -d',' -f4)
+    # Try ZTE Format (AT+ZRSSI)
+    raw=$(at_cmd 'AT+ZRSSI' 2>/dev/null)
+    if echo "$raw" | grep -q '+ZRSSI:'; then
+        local values
+        values=$(echo "$raw" | grep '+ZRSSI:' | sed 's/.*+ZRSSI:[[:space:]]*//' | tr -d ' \r')
+        rsrp=$(echo "$values" | cut -d',' -f1)
+        rsrq=$(echo "$values" | cut -d',' -f2)
+        rssi=$(echo "$values" | cut -d',' -f3)
+        snr=$(echo "$values" | cut -d',' -f4)
+    else
+        # Try Quectel Format (AT+QCSQ)
+        # Returns: +QCSQ: "LTE",rssi,rsrp,sinr,rsrq
+        raw=$(at_cmd 'AT+QCSQ' 2>/dev/null)
+        if echo "$raw" | grep -q '+QCSQ:'; then
+            local values
+            values=$(echo "$raw" | grep '+QCSQ:' | sed 's/.*+QCSQ:[[:space:]]*//' | tr -d ' \r"')
+            rssi=$(echo "$values" | cut -d',' -f2)
+            rsrp=$(echo "$values" | cut -d',' -f3)
+            snr=$(echo "$values" | cut -d',' -f4)
+            rsrq=$(echo "$values" | cut -d',' -f5)
+        else
+            # Fallback to standard CSQ if specific commands fail
+            raw=$(at_cmd 'AT+CSQ' 2>/dev/null)
+            if echo "$raw" | grep -q '+CSQ:'; then
+                rssi=$(echo "$raw" | grep '+CSQ:' | awk '{print $2}' | cut -d',' -f1)
+                # Map CSQ to dBm roughly: -113 + (rssi * 2)
+                [ "$rssi" -le 31 ] && rssi=$(( -113 + (rssi * 2) )) || rssi="0"
+            fi
+        fi
+    fi
 
     echo "${rsrp:-0} ${rsrq:-0} ${rssi:-0} ${snr:-0}"
 }
@@ -860,50 +891,34 @@ collect_latency() {
     done
     echo "9999"
 }
-
 collect_throughput() {
-    # Returns: dl_bytes ul_bytes (delta since last call)
-    # Uses /proc/net/dev for the WAN interface (wwan0 typically)
     local iface=$(uci -q get network.${MODEM_IFACE}.l3_device || echo "rmnet_mhi0.1")
-    local stats
-    stats=$(grep "$iface" /proc/net/dev 2>/dev/null | tr -s ' ')
+    local stats=$(grep "$iface" /proc/net/dev 2>/dev/null)
+    [ -z "$stats" ] && { echo "0 0"; return; }
 
-    if [ -z "$stats" ]; then
-        echo "0 0"
-        return
-    fi
+    # Robust parsing: Find interface name, next field is RX, +9 fields is TX
+    local rx_bytes=$(echo "$stats" | awk -v iface="$iface" -F'[: ]+' '{for(i=1;i<=NF;i++) if($i==iface) {print $(i+1); break}}')
+    local tx_bytes=$(echo "$stats" | awk -v iface="$iface" -F'[: ]+' '{for(i=1;i<=NF;i++) if($i==iface) {print $(i+9); break}}')
 
-    local rx_bytes tx_bytes
-    rx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $3}')
-    tx_bytes=$(echo "$stats" | awk -F'[: ]+' '{print $11}')
-
-    # Guard: ensure integer values (empty/malformed → 0)
     case "$rx_bytes" in ''|*[!0-9]*) rx_bytes=0 ;; esac
     case "$tx_bytes" in ''|*[!0-9]*) tx_bytes=0 ;; esac
 
-    # Store in temp file for delta calculation
     local prev_file="/tmp/router-diag-throughput"
     if [ -f "$prev_file" ]; then
-        local prev_rx prev_tx prev_time
+        local prev_rx prev_tx prev_time now
         read prev_rx prev_tx prev_time < "$prev_file"
-        local now_time
-        now_time=$(epoch)
-        local delta_t=$((now_time - prev_time))
-        if [ "$delta_t" -gt 0 ]; then
-            local dl=$((rx_bytes - prev_rx))
-            local ul=$((tx_bytes - prev_tx))
-            # Handle counter wrap
-            [ "$dl" -lt 0 ] && dl=0
-            [ "$ul" -lt 0 ] && ul=0
-            echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
-            echo "$dl $ul"
-            return
-        fi
+        now=$(date +%s)
+        local diff_rx=$((rx_bytes - prev_rx))
+        local diff_tx=$((tx_bytes - prev_tx))
+        [ $diff_rx -lt 0 ] && diff_rx=0
+        [ $diff_tx -lt 0 ] && diff_tx=0
+        echo "$diff_rx $diff_tx"
+    else
+        echo "0 0"
     fi
-
-    echo "$rx_bytes $tx_bytes $(epoch)" > "$prev_file"
-    echo "0 0"
+    echo "$rx_bytes $tx_bytes $(date +%s)" > "$prev_file"
 }
+
 
 collect_system() {
     # Returns: load_1m mem_free_kb sensor1_val sensor2_val ...
@@ -1393,7 +1408,7 @@ cmd_luci_json() {
         last_mem=$(echo "$sys" | awk '{print $2}')
         # Sensors values are from field 3 onwards
         local sensor_vals
-        sensor_vals=$(echo "$sys" | cut -d' ' -f3- | tr ' ' ',')
+        sensor_vals=$(echo "$sys" | cut -d' ' -f3- | tr ' ' ',' | sed 's/^,//')
     fi
 
     # --- Health status ---
@@ -1520,6 +1535,8 @@ cmd_luci_json() {
     "email_enabled": "$EMAIL_ENABLED",
     "email_to": "$EMAIL_TO",
     "collect_interval": "$COLLECT_INTERVAL",
+    "gemini_api_key": "$([ -n "$GEMINI_API_KEY" ] && echo "Configured" || echo "")",
+    "gemini_model": "$GEMINI_MODEL",
     "metrics_path": "$METRICS_PATH",
     "metrics_max_size": "$MAX_FILE_SIZE_MB",
     "sensors": "$SENSORS",
@@ -1554,7 +1571,7 @@ gemini_request() {
 
     # Escape the prompt for JSON
     local escaped_prompt
-    escaped_prompt=$(printf '%s' "$prompt" | tr -d '\r' | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g')
+    escaped_prompt=$(printf "%s" "$prompt" | tr -d "\r" | tr "\n" " " | sed "s/\\/\\\\/g; s/\"/\\\"/g; s/\t/\\t/g")
 
     local payload
     payload=$(cat << JSONEOF
@@ -1576,16 +1593,10 @@ gemini_request() {
 }
 JSONEOF
 )
-      "text": "You are a network diagnostics expert for an MF286D LTE router running OpenWRT. Analyze metrics and provide specific, actionable recommendations. Format your response as:\nSTATUS: [GOOD|WARNING|CRITICAL]\nDIAGNOSIS: [1-2 sentence summary]\nRECOMMENDATIONS:\n- [specific action 1]\n- [specific action 2]\nACTION: [action type]\n\nACTION types:\n- none — everything is fine, no action needed\n- restart_service:name — restart a specific service (e.g., dnsmasq, adblock-lean, https-dns-proxy)\n- reload_firewall — reload firewall rules\n- band_slam:"bands" — force the modem to specific LTE bands (e.g., band_slam:\"1 3 20\") if signal is poor or CA dropped. Use this when current bands show low SNR or high latency compared to typical performance.\n- restart_wifi — restart WiFi radios (only if SSIDs stopped broadcasting)\n- flush_arp — flush ARP cache (if pings fail but net looks healthy)\n- investigate_dns — DNS broken, auto-fixes exhausted\n- investigate_network — complex issue, needs human\n\nContext provided includes local weather (to correlate environmental interference like rain fade) and current LTE bands. Use the log entries to identify root causes. If temperature is critical, the tool will automatically kill heavy processes.\n\nIMPORTANT: Unreachable devices are INFORMATIONAL ONLY and NEVER a reason to take action. Devices go offline, sleep, leave the network — this is completely normal. Do NOT recommend restart_wifi based on unreachable device counts.\n\nIMPORTANT: The traffic volume metric is NOT a speed test. Low traffic volume simply means nothing was being actively downloaded — it does NOT indicate a slow connection. Never diagnose throughput problems from this metric alone.\n\nIMPORTANT: Check RECENT AUTO-FIX ATTEMPTS. If a service has already been restarted 2+ times in the last hour, do NOT recommend restarting it again — use investigate_dns or investigate_network instead.\n\nIMPORTANT: LTE signal strength (RSRP) between -100 and -112 dBm is the NORMAL BASELINE for this location. Do NOT flag this range as an issue. Only flag if RSRP drops below -115 dBm AND SNR drops below 5 dB simultaneously."
-    }]
-  }
-}
-JSONEOF
-)
 
     response=$(curl -s --max-time 30 \
         "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
-        -H 'Content-Type: application/json' \
+        -H "Content-Type: application/json" \
         -H "x-goog-api-key: $GEMINI_API_KEY" \
         -d "$payload" 2>/dev/null)
 
@@ -1601,7 +1612,7 @@ JSONEOF
 
     # Check for errors (jsonfilter for robust JSON parsing)
     local err_msg
-    err_msg=$(echo "$response" | jsonfilter -e '@.error.message' 2>/dev/null)
+    err_msg=$(echo "$response" | jsonfilter -e "@.error.message" 2>/dev/null)
     if [ -n "$err_msg" ]; then
         log_err "Gemini API error: $err_msg"
         return 1
@@ -1609,18 +1620,13 @@ JSONEOF
 
     # Extract text from response using jsonfilter
     local text
-    text=$(echo "$response" | jsonfilter -e '@.candidates[0].content.parts[0].text' 2>/dev/null)
+    text=$(echo "$response" | jsonfilter -e "@.candidates[0].content.parts[0].text" 2>/dev/null)
 
     # Unescape JSON strings
-    text=$(printf '%b' "$text" 2>/dev/null || echo "$text")
+    text=$(printf "%b" "$text" 2>/dev/null || echo "$text")
 
     echo "$text"
 }
-
-# ==========================================================
-# Analysis Engine
-# ==========================================================
-
 build_analysis_prompt() {
     local current_metrics="$1"
     local trigger_reason="$2"
@@ -3208,8 +3214,13 @@ Commands:
 
 Config keys:
   api_key, model, interval, latency,
-  hourly, cooldown, email_to, email_from, email_app_password,
-  email_enabled
+  rsrp, rsrp_base, snr_base, services,
+  hourly, cooldown, email_to, email_from, 
+  email_app_password, email_enabled,
+  flash_safe, sync_records,
+  metrics_path, metrics_max_size,
+  lat, lon, weather_api_key, self_heal,
+  model_name, site_type
 
 Examples:
   $PROG setup                    # First-time setup
@@ -3221,6 +3232,11 @@ USAGE
 }
 
 # --- Entry Point ---
+# ==========================================================
+# Main Execution
+# ==========================================================
+
+if [ "${1:-}" != "--no-exec" ]; then
 case "${1:-}" in
     setup)
         cmd_setup
@@ -3266,3 +3282,4 @@ case "${1:-}" in
         exit 1
         ;;
 esac
+fi

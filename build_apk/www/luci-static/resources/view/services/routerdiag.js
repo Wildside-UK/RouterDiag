@@ -333,6 +333,8 @@ return view.extend({
 			{ key: 'email_enabled',   configKey: 'email_enabled',     label: _('Email Notifications'),     type: 'toggle' },
 			{ key: 'email_to',        configKey: 'email_to',          label: _('Email Address'),           type: 'text' },
 			{ key: 'interval',        configKey: 'collect_interval',  label: _('Collect Interval (sec)'),  type: 'number' },
+			{ key: 'api_key',         configKey: 'gemini_api_key',    label: _('Gemini API Key'),          type: 'text' },
+			{ key: 'model',           configKey: 'gemini_model',      label: _('Gemini Model'),            type: 'model' },
 			{ key: 'metrics_path',    configKey: 'metrics_path',      label: _('CSV Save Path'),           type: 'text' },
 			{ key: 'metrics_max_size', configKey: 'metrics_max_size', label: _('Max CSV Size (MB)'),       type: 'number' },
 			{ key: 'weather_api_key', configKey: 'weather_api_key',   label: _('OpenWeather API Key'),     type: 'text' },
@@ -353,6 +355,14 @@ return view.extend({
 				input = E('select', { 'data-key': f.key, 'data-orig': val }, [
 					E('option', { value: '1', selected: val === '1' ? '' : null }, _('Enabled')),
 					E('option', { value: '0', selected: val === '0' ? '' : null }, _('Disabled'))
+				]);
+			} else if (f.type === 'model') {
+				input = E('select', { 'data-key': f.key, 'data-orig': val }, [
+					E('option', { value: 'gemini-3.1-flash-lite-latest', selected: val === 'gemini-3.1-flash-lite-latest' ? '' : null }, _('Gemini 3.1 Flash-Lite (Default)')),
+					E('option', { value: 'gemini-3.1-flash-latest',      selected: val === 'gemini-3.1-flash-latest' ? '' : null },      _('Gemini 3.1 Flash')),
+					E('option', { value: 'gemini-3.1-pro-latest',        selected: val === 'gemini-3.1-pro-latest' ? '' : null },        _('Gemini 3.1 Pro')),
+					E('option', { value: 'gemini-2.5-flash-latest',      selected: val === 'gemini-2.5-flash-latest' ? '' : null },      _('Gemini 2.5 Flash')),
+					E('option', { value: 'gemini-2.5-pro-latest',        selected: val === 'gemini-2.5-pro-latest' ? '' : null },        _('Gemini 2.5 Pro'))
 				]);
 			} else {
 				input = E('input', {

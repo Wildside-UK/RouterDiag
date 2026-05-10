@@ -10,10 +10,40 @@ FAKE_ROOT="/tmp/router-diag-test"
 rm -rf "$FAKE_ROOT"
 mkdir -p "$FAKE_ROOT/proc" "$FAKE_ROOT/sys/class/thermal" "$FAKE_ROOT/tmp" "$FAKE_ROOT/mnt/usb/router-diag"
 
+# Create dummy files from snapshot
+get_snap "FILE_EXISTS" | while read -r f; do
+    mkdir -p "$FAKE_ROOT$(dirname "$f")"
+    touch "$FAKE_ROOT$f"
+done
+
 # Helper to extract from snapshot
 get_snap() {
     sed -n "/\[$1\]/,/\[/p" "$SNAPSHOT_FILE" | grep -v "\[" | grep -v "^$"
 }
+
+# ... (previous mocks) ...
+
+nft() {
+    # If the script calls 'nft list ruleset', echo 'chain ' N times
+    local count
+    count=$(get_snap "NFT")
+    for i in $(seq 1 ${count:-0}); do echo "chain mock"; done
+}
+
+# Mock '[' to support redirected file tests
+# This is a bit advanced but it works for local testing
+'['() {
+    local args=("$@")
+    local i=0
+    while [ $i -lt ${#args[@]} ]; do
+        if [[ "${args[$i]}" == /etc/* ]] || [[ "${args[$i]}" == /var/* ]]; then
+            args[$i]="$FAKE_ROOT${args[$i]}"
+        fi
+        i=$((i+1))
+    done
+    builtin '[' "${args[@]}"
+}
+export -f '['
 
 # Mock Files
 get_snap "LOADAVG" > "$FAKE_ROOT/proc/loadavg"
