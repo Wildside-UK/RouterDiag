@@ -1195,6 +1195,7 @@ collect_dhcp_status() {
 
 # --- Emergency Offline Recovery ---
 
+# D50 simplified recovery: bounce modem (L1) -> reboot (L2). Old ZTE-era band+cell scrub levels removed.
 escalate_emergency_recovery() {
     local fail_file="/tmp/router-diag-offline-since"
     local now
@@ -1211,36 +1212,20 @@ escalate_emergency_recovery() {
 
     log_msg "EMERGENCY: Internet unreachable for ${elapsed_mins}m. Escalating triage..."
 
-    # Recovery Levels
     if [ "$elapsed_mins" -ge "$REBOOT_TIMEOUT_MIN" ]; then
-        # Level 4: The Nuclear Option
-        log_msg "EMERGENCY LEVEL 4: Timed out ($elapsed_mins >= $REBOOT_TIMEOUT_MIN). REBOOTING SYSTEM."
+        # Final escalation: full reboot
+        log_msg "EMERGENCY LEVEL 2: Timed out ($elapsed_mins >= $REBOOT_TIMEOUT_MIN). REBOOTING SYSTEM."
         echo "REBOOT_REQUIRED_$(date +%s)" > /tmp/router-diag-last-action
         sync
         reboot
-    elif [ "$elapsed_mins" -ge 20 ]; then
-        # Level 3: Service Refresh + Final Band Scrub
-        log_msg "EMERGENCY LEVEL 3: Refreshing Auth Services & Bands"
-        modemband.sh setbands default >/dev/null 2>&1
-        $SMS_TOOL -d "$AT_PORT" at 'AT+ZLOCKCELL=0' >/dev/null 2>&1
-        for svc in $MANAGED_SERVICES; do
-            /etc/init.d/"$svc" restart >/dev/null 2>&1
-        done
-        # Record this for post-mortem
-        echo "LEVEL_3_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
-    elif [ "$elapsed_mins" -ge 10 ]; then
-        # Level 2: Modem Kick (Reset Bands)
-        log_msg "EMERGENCY LEVEL 2: Resetting Modem Bands"
-        modemband.sh setbands default >/dev/null 2>&1
-        # Also unlock any cell locks if sms_tool supports it
-        $SMS_TOOL -d "$AT_PORT" at 'AT+ZLOCKCELL=0' >/dev/null 2>&1
-        echo "LEVEL_2_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
     elif [ "$elapsed_mins" -ge 2 ]; then
-        # Level 1: Soft Reset (Interface Bounce)
-        log_msg "EMERGENCY LEVEL 1: Bouncing Modem Interface ($MODEM_IFACE)"
-        ifdown "$MODEM_IFACE" >/dev/null 2>&1
+        # First escalation: bounce modem interface + release any stale cell lock
+        log_msg "EMERGENCY LEVEL 1: Bouncing modem interface ($MODEM_IFACE) and releasing cell lock"
+        safe_run 15 ifdown "$MODEM_IFACE"
+        # Release Quectel cell lock (no-op if not locked). Param: 'release' then any lock id.
+        at_cmd 'AT+QNWLOCK="release",1' >/dev/null
         sleep 5
-        ifup "$MODEM_IFACE" >/dev/null 2>&1
+        safe_run 15 ifup "$MODEM_IFACE"
         echo "LEVEL_1_APPLIED_$(date +%s)" > /tmp/router-diag-last-action
     fi
 }
