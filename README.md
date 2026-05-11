@@ -1,6 +1,6 @@
 # RouterDiag
 
-AI-Powered Router Diagnostics for OpenWrt (specifically designed for Xunison Exigo D50 5G (Qualcomm ipq50xx, Quectel RM500Q-AE modem, mainline ath11k WiFi)).
+AI-Powered Router Diagnostics for OpenWrt. Designed for the Xunison Exigo D50 5G (Qualcomm ipq50xx, Quectel RM500Q-AE modem, mainline ath11k WiFi).
 
 ## Overview
 
