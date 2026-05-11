@@ -3178,6 +3178,28 @@ cmd_start() {
     echo "router-diag daemon started (PID $pid)"
 }
 
+# Procd entry point. Runs daemon_loop in the foreground so procd can supervise it.
+# Manual invocations should use 'start' which forks into the background.
+cmd_daemon() {
+    mount_usb || die "USB not available"
+    load_config || die "Not configured. Run '$PROG setup' first."
+    [ -n "$GEMINI_API_KEY" ] || die "No API key. Run '$PROG setup' first."
+
+    # Refuse to run if another instance is already alive
+    if [ -f "$PID_FILE" ]; then
+        local existing
+        existing=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$existing" ] && [ "$existing" != "$$" ] && kill -0 "$existing" 2>/dev/null; then
+            die "Already running (PID $existing). Refusing to start a second instance."
+        fi
+    fi
+    rm -f "$LOCK_FILE"
+    echo $$ > "$PID_FILE"
+
+    log_msg "Daemon started in foreground (PID $$)"
+    daemon_loop
+}
+
 cmd_stop() {
     local stopped=0
 
@@ -3267,6 +3289,9 @@ case "${1:-}" in
         ;;
     start)
         cmd_start
+        ;;
+    daemon)
+        cmd_daemon
         ;;
     stop)
         cmd_stop
