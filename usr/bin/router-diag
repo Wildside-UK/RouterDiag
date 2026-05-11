@@ -708,12 +708,12 @@ _setup_modem() {
         cur_cell=$(echo "$raw_cell" | grep "+QNWLOCK:" | awk -F',' '{printf "%s,%s", $3, $4}')
     fi
 
-    echo "Preferred Setup (for offline recovery auto-restoration):"
+    echo "Preferred Setup (Documentation only; Quectel persists these at NV level):"
     
     if [ -n "$cur_bands" ]; then
         echo -n "Bands to lock to [Detected: $cur_bands]: "
     else
-        echo -n "Bands to lock to (e.g. '1 3 20' or 'skip'): "
+        echo -n "Bands to lock to (space-separated, e.g. '1 3 20' or 'skip'): "
     fi
     read input_bands
     [ -z "$input_bands" ] && PREFERRED_BANDS="$cur_bands"
@@ -722,7 +722,7 @@ _setup_modem() {
     if [ -n "$cur_cell" ]; then
         echo -n "Cell to lock to [Detected: $cur_cell]: "
     else
-        echo -n "Cell to lock to (e.g. 'EARFCN,PCI' or 'skip'): "
+        echo -n "Cell to lock to (e.g. '1363,200' for EARFCN,PCI or 'skip'): "
     fi
     read input_cell
     [ -z "$input_cell" ] && PREFERRED_CELL="$cur_cell"
@@ -780,26 +780,16 @@ collect_bands() {
     # Returns: current band info (e.g., "B1 (PCC) + B3 (SCC)")
     local raw bands=""
 
-    # Try ZTE Format (AT+ZCAINFO?)
-    raw=$(at_cmd 'AT+ZCAINFO?' 2>/dev/null)
-    if echo "$raw" | grep -q "+ZCAINFO:"; then
-        bands=$(echo "$raw" | grep "+ZCAINFO:" | sed 's/+ZCAINFO: //' | awk -F',' '{
-            type=$1; band=$3;
+    # Quectel RM500Q-AE primary path (AT+QCAINFO)
+    # Returns: +QCAINFO: "PCC",earfcn,bandwidth,"LTE BAND X",...
+    raw=$(at_cmd 'AT+QCAINFO' 2>/dev/null)
+    if echo "$raw" | grep -q "+QCAINFO:"; then
+        bands=$(echo "$raw" | grep "+QCAINFO:" | sed 's/+QCAINFO: //' | awk -F',' '{
+            type=$1; gsub(/"/,"",type);
+            band=$4; gsub(/"/,"",band); gsub(/LTE BAND /,"B",band);
             if(type=="PCC") printf "%s (PCC) ", band;
             else if(type=="SCC") printf "+ %s (SCC) ", band;
         }')
-    else
-        # Try Quectel Format (AT+QCAINFO)
-        # Returns: +QCAINFO: "PCC",earfcn,bandwidth,"LTE BAND X",...
-        raw=$(at_cmd 'AT+QCAINFO' 2>/dev/null)
-        if echo "$raw" | grep -q "+QCAINFO:"; then
-            bands=$(echo "$raw" | grep "+QCAINFO:" | sed 's/+QCAINFO: //' | awk -F',' '{
-                type=$1; gsub(/"/,"",type);
-                band=$4; gsub(/"/,"",band); gsub(/LTE BAND /,"B",band);
-                if(type=="PCC") printf "%s (PCC) ", band;
-                else if(type=="SCC") printf "+ %s (SCC) ", band;
-            }')
-        fi
     fi
 
     echo "${bands:-Unknown}" | sed 's/ $//'
@@ -889,34 +879,23 @@ collect_signal() {
     # Returns: rsrp rsrq rssi snr
     local raw rsrp="0" rsrq="0" rssi="0" snr="0"
 
-    # Try ZTE Format (AT+ZRSSI)
-    raw=$(at_cmd 'AT+ZRSSI' 2>/dev/null)
-    if echo "$raw" | grep -q '+ZRSSI:'; then
+    # Quectel RM500Q-AE primary path (AT+QCSQ)
+    # Returns: +QCSQ: "LTE",rssi,rsrp,sinr,rsrq
+    raw=$(at_cmd 'AT+QCSQ' 2>/dev/null)
+    if echo "$raw" | grep -q '+QCSQ:'; then
         local values
-        values=$(echo "$raw" | grep '+ZRSSI:' | sed 's/.*+ZRSSI:[[:space:]]*//' | tr -d ' \r')
-        rsrp=$(echo "$values" | cut -d',' -f1)
-        rsrq=$(echo "$values" | cut -d',' -f2)
-        rssi=$(echo "$values" | cut -d',' -f3)
+        values=$(echo "$raw" | grep '+QCSQ:' | sed 's/.*+QCSQ:[[:space:]]*//' | tr -d ' \r"')
+        rssi=$(echo "$values" | cut -d',' -f2)
+        rsrp=$(echo "$values" | cut -d',' -f3)
         snr=$(echo "$values" | cut -d',' -f4)
+        rsrq=$(echo "$values" | cut -d',' -f5)
     else
-        # Try Quectel Format (AT+QCSQ)
-        # Returns: +QCSQ: "LTE",rssi,rsrp,sinr,rsrq
-        raw=$(at_cmd 'AT+QCSQ' 2>/dev/null)
-        if echo "$raw" | grep -q '+QCSQ:'; then
-            local values
-            values=$(echo "$raw" | grep '+QCSQ:' | sed 's/.*+QCSQ:[[:space:]]*//' | tr -d ' \r"')
-            rssi=$(echo "$values" | cut -d',' -f2)
-            rsrp=$(echo "$values" | cut -d',' -f3)
-            snr=$(echo "$values" | cut -d',' -f4)
-            rsrq=$(echo "$values" | cut -d',' -f5)
-        else
-            # Fallback to standard CSQ if specific commands fail
-            raw=$(at_cmd 'AT+CSQ' 2>/dev/null)
-            if echo "$raw" | grep -q '+CSQ:'; then
-                rssi=$(echo "$raw" | grep '+CSQ:' | awk '{print $2}' | cut -d',' -f1)
-                # Map CSQ to dBm roughly: -113 + (rssi * 2)
-                [ "$rssi" -le 31 ] && rssi=$(( -113 + (rssi * 2) )) || rssi="0"
-            fi
+        # Fallback to standard CSQ if specific commands fail
+        raw=$(at_cmd 'AT+CSQ' 2>/dev/null)
+        if echo "$raw" | grep -q '+CSQ:'; then
+            rssi=$(echo "$raw" | grep '+CSQ:' | awk '{print $2}' | cut -d',' -f1)
+            # Map CSQ to dBm roughly: -113 + (rssi * 2)
+            [ "$rssi" -le 31 ] && rssi=$(( -113 + (rssi * 2) )) || rssi="0"
         fi
     fi
 
@@ -2958,26 +2937,7 @@ daemon_loop() {
         local now
         now=$(epoch)
 
-        # --- Stability Watch: Restore Preferred Setup ---
-        if [ "$HEALTH_STATUS" = "OK" ] && [ "$collect_count" -gt "$warmup_cycles" ]; then
-            if [ -n "$PREFERRED_BANDS" ] || [ -n "$PREFERRED_CELL" ]; then
-                # Only check if we are NOT currently on the preferred setup
-                local current_bands restore_needed=0
-                current_bands=$(collect_bands)
-                
-                # Simple check for preferred bands in current bands string
-                if [ -n "$PREFERRED_BANDS" ] && ! echo "$current_bands" | grep -q "$PREFERRED_BANDS"; then
-                    restore_needed=1
-                fi
-                
-                if [ "$restore_needed" -eq 1 ]; then
-                    log_msg "STABILITY: System is stable. Restoring preferred setup..."
-                    [ -n "$PREFERRED_BANDS" ] && modemband.sh setbands "$PREFERRED_BANDS" >/dev/null 2>&1
-                    [ -n "$PREFERRED_CELL" ] && $SMS_TOOL -d "$AT_PORT" at "AT+ZLOCKCELL=$PREFERRED_CELL" >/dev/null 2>&1
-                    log_msg "STABILITY: Preferred setup restored ($PREFERRED_BANDS / $PREFERRED_CELL)"
-                fi
-            fi
-        fi
+        # Quectel persists band selection and cell lock at modem NV level; no periodic restore needed.
 
         # 1. Collect metrics
         local metrics
