@@ -120,9 +120,15 @@ epoch() {
 }
 
 # Send AT command via sms_tool
+safe_run() {
+    local secs="$1"
+    shift
+    timeout "$secs" "$@" 2>/dev/null
+}
+
 at_cmd() {
     local cmd="$1"
-    $SMS_TOOL -d "$AT_PORT" at "$cmd" 2>/dev/null
+    safe_run 10 $SMS_TOOL -d "$AT_PORT" at "$cmd"
 }
 
 json_escape() {
@@ -143,7 +149,7 @@ send_email() {
 
     printf "To: %s\nSubject: %s\n\n%b" \
         "$EMAIL_TO" "$subject" "$body" | \
-    msmtp "$EMAIL_TO" 2>/dev/null
+    safe_run 30 msmtp "$EMAIL_TO"
 
     if [ $? -eq 0 ]; then
         log_msg "Email sent successfully"
@@ -418,9 +424,9 @@ mount_usb() {
     USB_DEVICE=$(find_usb_device) || return 1
 
     # Try mounting
-    mount "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
-    mount -t ext4 "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
-    mount -t vfat "$USB_DEVICE" "$USB_MOUNT" 2>/dev/null && return 0
+    safe_run 10 mount "$USB_DEVICE" "$USB_MOUNT" && return 0
+    safe_run 10 mount -t ext4 "$USB_DEVICE" "$USB_MOUNT" && return 0
+    safe_run 10 mount -t vfat "$USB_DEVICE" "$USB_MOUNT" && return 0
 
     return 1
 }
@@ -584,11 +590,11 @@ cmd_setup() {
     # Validate key with a test request
     echo "Validating API key..."
     local test_response
-    test_response=$(curl -s -w "\n%{http_code}" \
+    test_response=$(safe_run 30 curl -s -w "\n%{http_code}" \
         "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
         -H 'Content-Type: application/json' \
         -H "x-goog-api-key: $GEMINI_API_KEY" \
-        -d '{"contents":[{"parts":[{"text":"Reply with just: OK"}]}]}' 2>/dev/null)
+        -d '{"contents":[{"parts":[{"text":"Reply with just: OK"}]}]}')
 
     local http_code
     http_code=$(echo "$test_response" | tail -1)
@@ -656,7 +662,7 @@ _setup_email() {
         printf "To: %s\nSubject: %s\n\n%s" \
             "$EMAIL_TO" "[router-diag] Test — setup complete" \
             "This is a test email from router-diag. If you received this, email notifications are working." | \
-        msmtp "$EMAIL_TO" 2>/dev/null
+        safe_run 30 msmtp "$EMAIL_TO"
 
         if [ $? -eq 0 ]; then
             echo "Test email sent! Check your inbox."
@@ -759,7 +765,7 @@ collect_weather() {
     [ -n "$WEATHER_API_KEY" ] || { echo "none|0|0"; return; }
 
     local res
-    res=$(curl -s --max-time 5 "https://api.openweathermap.org/data/2.5/weather?lat=$LOCATION_LAT&lon=$LOCATION_LON&appid=$WEATHER_API_KEY&units=metric" 2>/dev/null)
+    res=$(safe_run 10 curl -s --max-time 5 "https://api.openweathermap.org/data/2.5/weather?lat=$LOCATION_LAT&lon=$LOCATION_LON&appid=$WEATHER_API_KEY&units=metric")
     [ -n "$res" ] || { echo "error|0|0"; return; }
 
     local desc temp hum
@@ -922,7 +928,7 @@ collect_latency() {
     # Tries 1.1.1.1 first, falls back to 8.8.8.8 if unreachable
     local ping_out result target
     for target in 1.1.1.1 8.8.8.8; do
-        ping_out=$(ping -c 3 -W 2 "$target" 2>/dev/null)
+        ping_out=$(safe_run 10 ping -c 3 -W 2 "$target")
         # Extract avg: second field after = and split by /
         result=$(echo "$ping_out" | grep -E '(round-trip|rtt)' | \
             sed 's/.*= *//' | cut -d'/' -f2)
@@ -1169,7 +1175,7 @@ collect_dhcp_status() {
     while read -r _expiry mac ip hostname _rest; do
         [ -n "$ip" ] || continue
         total=$((total + 1))
-        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+        if safe_run 5 ping -c 1 -W 1 "$ip" >/dev/null; then
             reachable=$((reachable + 1))
         else
             unreachable="${unreachable}  - ${hostname:-unknown} ($ip, $mac)\n"
@@ -1625,11 +1631,11 @@ gemini_request() {
 JSONEOF
 )
 
-    response=$(curl -s --max-time 30 \
+    response=$(safe_run 60 curl -s -X POST --max-time 55 \
         "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
         -H "Content-Type: application/json" \
         -H "x-goog-api-key: $GEMINI_API_KEY" \
-        -d "$payload" 2>/dev/null)
+        -d "$payload")
 
     if [ -z "$response" ]; then
         log_err "Network error: Empty response from Gemini API"
@@ -2154,7 +2160,7 @@ attempt_fix_service() {
 
     local before_state="DOWN (not running)"
     log_msg "AUTO-FIX: Restarting service $service"
-    /etc/init.d/"$service" restart 2>/dev/null
+    safe_run 30 /etc/init.d/"$service" restart
 
     # Service-specific settle delays (measured startup times + margin)
     case "$service" in
@@ -2205,9 +2211,9 @@ attempt_fix_interface() {
 
     local before_state="DOWN"
     log_msg "AUTO-FIX: Restarting interface $iface"
-    ifdown "$iface" 2>/dev/null
+    safe_run 15 ifdown "$iface"
     sleep 3
-    ifup "$iface" 2>/dev/null
+    safe_run 15 ifup "$iface"
     sleep 5
 
     # Verify it's up
@@ -2241,18 +2247,18 @@ attempt_fix_wifi() {
 
     # Capture before state
     local before_ssids
-    before_ssids=$(iwinfo 2>/dev/null | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
+    before_ssids=$(safe_run 5 iwinfo | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
     local before_state="${before_ssids:-no SSIDs broadcasting}"
 
     log_msg "AUTO-FIX: Restarting WiFi"
-    wifi down 2>/dev/null
+    safe_run 30 wifi down
     sleep 3
-    wifi up 2>/dev/null
+    safe_run 30 wifi up
     sleep 5
 
     # Verify at least one SSID is broadcasting
     local after_ssids
-    after_ssids=$(iwinfo 2>/dev/null | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
+    after_ssids=$(safe_run 5 iwinfo | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
     if [ -n "$after_ssids" ]; then
         local after_state="broadcasting: $after_ssids"
         log_msg "AUTO-FIX: WiFi restarted successfully"
@@ -2279,16 +2285,16 @@ attempt_fix_firewall() {
 
     # Capture before state
     local before_chains
-    before_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    before_chains=$(safe_run 10 nft list ruleset | grep -c "chain " || echo "0")
     local before_state="BROKEN ($before_chains nftables chains loaded)"
 
     log_msg "AUTO-FIX: Reloading firewall"
-    /etc/init.d/firewall restart 2>/dev/null
+    safe_run 30 /etc/init.d/firewall restart
     sleep 5
 
     # Verify rules are loaded (a working firewall has many chains)
     local after_chains
-    after_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    after_chains=$(safe_run 10 nft list ruleset | grep -c "chain " || echo "0")
     if [ "$after_chains" -gt 5 ] 2>/dev/null; then
         local after_state="OK ($after_chains nftables chains loaded)"
         log_msg "AUTO-FIX: Firewall reloaded successfully"
@@ -2333,7 +2339,7 @@ check_network_health() {
     local non_critical_fail=0
 
     # DNS resolution
-    if ! nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
+    if ! safe_run 10 nslookup google.com 127.0.0.1 >/dev/null; then
         failed_services="${failed_services}dns,"
         critical_fail=1
         attempt_fix_dns
@@ -2358,7 +2364,7 @@ check_network_health() {
 
     # WAN interface — report only, NEVER restart (QMI modem safety)
     local wan_status
-    wan_status=$(ifstatus ${MODEM_IFACE} 2>/dev/null)
+    wan_status=$(safe_run 5 ifstatus ${MODEM_IFACE})
     if ! echo "$wan_status" | grep -q '"up": true'; then
         failed_services="${failed_services}wan,"
         critical_fail=1
@@ -2367,7 +2373,7 @@ check_network_health() {
 
     # LAN interface
     local lan_status
-    lan_status=$(ifstatus lan 2>/dev/null)
+    lan_status=$(safe_run 5 ifstatus lan)
     if ! echo "$lan_status" | grep -q '"up": true'; then
         failed_services="${failed_services}lan,"
         critical_fail=1
@@ -2376,7 +2382,7 @@ check_network_health() {
 
     # Firewall (nftables rules loaded)
     local fw_chains
-    fw_chains=$(nft list ruleset 2>/dev/null | grep -c "chain " || echo "0")
+    fw_chains=$(safe_run 10 nft list ruleset | grep -c "chain " || echo "0")
     if [ "$fw_chains" -le 5 ] 2>/dev/null; then
         failed_services="${failed_services}firewall,"
         critical_fail=1
@@ -2395,7 +2401,7 @@ check_network_health() {
 
     # WiFi SSIDs — dynamically check all enabled wifi-iface sections
     local wifi_info wifi_fix_attempted checked_ssids iface_disabled iface_ssid iface_network
-    wifi_info=$(iwinfo 2>/dev/null)
+    wifi_info=$(safe_run 5 iwinfo)
     wifi_fix_attempted=0
     checked_ssids=""
     for iface in $(uci show wireless 2>/dev/null | grep '=wifi-iface' | cut -d'=' -f1 | cut -d'.' -f2); do
