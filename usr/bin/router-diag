@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==========================================================
-# router-diag — AI-Powered Router Diagnostics for MF286D
+# router-diag — AI-Powered Router Diagnostics for Xunison Exigo D50 5G
 # ==========================================================
 # Continuously monitors LTE signal, network performance, and
 # system health. Uses Google Gemini AI to diagnose issues and
@@ -21,17 +21,11 @@ if [ -f "/usr/share/router-diag/config.conf" ]; then
     DIAG_DIR="/usr/share/router-diag"
 elif [ -f "/etc/router-diag/config.conf" ]; then
     DIAG_DIR="/etc/router-diag"
-elif [ -f "/mnt/usb/router-diag/config.conf" ]; then
+elif [ -f "/mnt/usb/router-diag/config.conf" ] && mount | grep -q "/mnt/usb"; then
     DIAG_DIR="/mnt/usb/router-diag"
 else
     # First-time setup or no config found
-    # If a USB device is physically present, default to USB
-    if find_usb_device >/dev/null 2>&1; then
-        DIAG_DIR="/mnt/usb/router-diag"
-    else
-        # Otherwise default to internal for setup
-        DIAG_DIR="/usr/share/router-diag"
-    fi
+    DIAG_DIR="/usr/share/router-diag"
 fi
 
 CONFIG_FILE="$DIAG_DIR/config.conf"
@@ -48,7 +42,7 @@ ROUTER_MODEL="Xunison Exigo D50"
 SITE_TYPE="Rural"
 BASE_RSRP="-112"
 BASE_SNR="5"
-MANAGED_SERVICES="dnsmasq adblock-lean https-dns-proxy firewall wifi"
+MANAGED_SERVICES="dnsmasq adblock-lean https-dns-proxy firewall" # wifi excluded - on D50 ath11k DFS ch128, restart triggers 600s CAC.
 MODEM_IFACE="modem"         # The logical interface name (uci network name)
 PREFERRED_BANDS=""          # If set, Level 4 will restore these (e.g. "1 3 20")
 PREFERRED_CELL=""           # If set, Level 4 will restore this (e.g. "EARFCN,PCI")
@@ -522,30 +516,36 @@ cmd_setup() {
         echo -n "Use this USB device for persistent storage? (y/n) [y]: "
         read input_usb
         [ "$input_usb" = "n" ] || [ "$input_usb" = "N" ] || use_usb="y"
+
+        if [ "$use_usb" = "y" ]; then
+            if is_usb_mounted; then
+                echo "USB already mounted at $USB_MOUNT"
+            else
+                # Check if already has a filesystem
+                if block info "$USB_DEVICE" 2>/dev/null | grep -q "TYPE="; then
+                    echo "USB has existing filesystem."
+                    echo -n "Mount existing (m) or format fresh (f)? [m]: "
+                    read choice
+                    case "$choice" in
+                        f|F) format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed" ;;
+                        *)   mount_usb || die "Mount failed" ;;
+                    esac
+                else
+                    echo "USB has no filesystem. Formatting..."
+                    format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed"
+                fi
+            fi
+            # Add fstab entry for auto-mount
+            add_fstab_entry "$USB_DEVICE"
+        fi
+    else
+        echo "No USB device detected; using internal flash for persistence."
     fi
 
-    if [ "$use_usb" = "y" ]; then
-        if is_usb_mounted; then
-            echo "USB already mounted at $USB_MOUNT"
-        else
-            # Check if already has a filesystem
-            if block info "$USB_DEVICE" 2>/dev/null | grep -q "TYPE="; then
-                echo "USB has existing filesystem."
-                echo -n "Mount existing (m) or format fresh (f)? [m]: "
-                read choice
-                case "$choice" in
-                    f|F) format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed" ;;
-                    *)   mount_usb || die "Mount failed" ;;
-                esac
-            else
-                echo "USB has no filesystem. Formatting..."
-                format_usb "$(echo "$USB_DEVICE" | sed 's/[0-9]*$//')" || die "Format failed"
-            fi
+    if [ "$use_usb" = "n" ]; then
+        if [ -n "$USB_DEVICE" ]; then
+            echo "No USB device selected. Using internal flash storage."
         fi
-        # Add fstab entry for auto-mount
-        add_fstab_entry "$USB_DEVICE"
-    else
-        echo "No USB device selected. Using internal flash storage."
         echo -n "Enter storage path [/usr/share/router-diag]: "
         read input_path
         [ -n "$input_path" ] && {
