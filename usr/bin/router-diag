@@ -125,6 +125,11 @@ at_cmd() {
     $SMS_TOOL -d "$AT_PORT" at "$cmd" 2>/dev/null
 }
 
+json_escape() {
+    printf '%s' "$1" | sed 's|\\|\\\\|g; s|"|\\"|g; s|	|\\t|g' | \
+        awk '{printf "%s", (NR>1 ? "\\n" : "") $0}'
+}
+
 # ==========================================================
 # Email Notifications
 # ==========================================================
@@ -1501,12 +1506,6 @@ cmd_luci_json() {
         ' "$ANALYSIS_LOG")
     fi
 
-    # --- Escape strings for JSON ---
-    json_escape() {
-        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | \
-            awk '{printf "%s", (NR>1 ? "\\n" : "") $0}'
-    }
-
     local esc_analysis
     esc_analysis=$(json_escape "$last_analysis")
     local esc_failed
@@ -1600,9 +1599,10 @@ gemini_request() {
         system_instr="You are a data compression engine for LTE router telemetry. Your goal is to distill a block of 60 high-resolution CSV entries (2 hours) into a SINGLE representative CSV line for persistent storage. Ensure peaks in temperature and load are preserved, while signal values are averaged. Return ONLY the CSV line."
     fi
 
-    # Escape the prompt for JSON
-    local escaped_prompt
-    escaped_prompt=$(printf "%s" "$prompt" | tr -d "\r" | tr "\n" " " | sed "s/\\/\\\\/g; s/\"/\\\"/g; s/\t/\\t/g")
+    # Escape for JSON
+    local escaped_prompt escaped_system_instr
+    escaped_prompt=$(json_escape "$prompt")
+    escaped_system_instr=$(json_escape "$system_instr")
 
     local payload
     payload=$(cat << JSONEOF
@@ -1618,7 +1618,7 @@ gemini_request() {
   },
   "systemInstruction": {
     "parts": [{
-      "text": "$system_instr"
+      "text": "$escaped_system_instr"
     }]
   }
 }

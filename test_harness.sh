@@ -6,44 +6,21 @@ SNAPSHOT_FILE="/home/wner/.gemini/tmp/owner/router_snapshot.txt"
 PROJECT_DIR="/mnt/c/Users/Owner/Documents/Github/RouterDiag"
 FAKE_ROOT="/tmp/router-diag-test"
 
+# Helper to extract from snapshot
+get_snap() {
+    sed -n "/\[$1\]/,/\[/p" "$SNAPSHOT_FILE" | grep -v "\[" | grep -v "^$"
+}
+
 # Setup fake environment
 rm -rf "$FAKE_ROOT"
 mkdir -p "$FAKE_ROOT/proc" "$FAKE_ROOT/sys/class/thermal" "$FAKE_ROOT/tmp" "$FAKE_ROOT/mnt/usb/router-diag"
+mkdir -p "$FAKE_ROOT/usr/share/router-diag"
 
 # Create dummy files from snapshot
 get_snap "FILE_EXISTS" | while read -r f; do
     mkdir -p "$FAKE_ROOT$(dirname "$f")"
     touch "$FAKE_ROOT$f"
 done
-
-# Helper to extract from snapshot
-get_snap() {
-    sed -n "/\[$1\]/,/\[/p" "$SNAPSHOT_FILE" | grep -v "\[" | grep -v "^$"
-}
-
-# ... (previous mocks) ...
-
-nft() {
-    # If the script calls 'nft list ruleset', echo 'chain ' N times
-    local count
-    count=$(get_snap "NFT")
-    for i in $(seq 1 ${count:-0}); do echo "chain mock"; done
-}
-
-# Mock '[' to support redirected file tests
-# This is a bit advanced but it works for local testing
-'['() {
-    local args=("$@")
-    local i=0
-    while [ $i -lt ${#args[@]} ]; do
-        if [[ "${args[$i]}" == /etc/* ]] || [[ "${args[$i]}" == /var/* ]]; then
-            args[$i]="$FAKE_ROOT${args[$i]}"
-        fi
-        i=$((i+1))
-    done
-    builtin '[' "${args[@]}"
-}
-export -f '['
 
 # Mock Files
 get_snap "LOADAVG" > "$FAKE_ROOT/proc/loadavg"
@@ -67,11 +44,7 @@ export METRICS_PATH="$DIAG_DIR/metrics.csv"
 export ACTIVE_METRICS_FILE="$FAKE_ROOT/tmp/router-diag-active.csv"
 export PID_FILE="$FAKE_ROOT/tmp/router-diag.pid"
 
-# Load the real script FIRST
-source "$PROJECT_DIR/usr/bin/router-diag" --no-exec
-
-# --- OVERRIDE Functions AFTER sourcing ---
-
+# Mock core utilities
 at_cmd() {
     case "$1" in
         AT+ZRSSI)    get_snap "ZRSSI" ;;
@@ -82,14 +55,12 @@ at_cmd() {
         *) echo "MOCK AT: $1" ;;
     esac
 }
+export -f at_cmd
 
 pgrep() {
     get_snap "SERVICES" | grep -iq "$2" && echo "1234" || return 1
 }
-
-ifstatus() {
-    get_snap "IFSTATUS_${1^^}"
-}
+export -f pgrep
 
 uci() {
     case "$1" in
@@ -98,38 +69,89 @@ uci() {
         *) echo "" ;;
     esac
 }
+export -f uci
 
 nft() {
     get_snap "NFT"
 }
+export -f nft
 
 modemband.sh() {
     get_snap "MODEMBAND"
 }
+export -f modemband.sh
 
 jsonfilter() {
     if command -v jq >/dev/null 2>&1; then
         local pattern
         pattern=$(echo "$2" | sed 's/@.//; s/\[0\]//g')
-        jq -r ".$pattern"
+        # Return empty if key not found to avoid triggering error checks in script
+        jq -r ".$pattern // empty"
     else
-        echo "MOCK_JSON_VALUE"
+        echo ""
     fi
 }
+export -f jsonfilter
 
-# Mock cat to use our fake root for /proc and /sys
-cat() {
-    local real_cat=$(which cat)
-    if [[ "$1" == /proc/* ]] || [[ "$1" == /sys/* ]]; then
-        $real_cat "$FAKE_ROOT$1"
-    else
-        $real_cat "$@"
-    fi
+# Mock curl to capture payload
+curl() {
+    local args=("$@")
+    local i=0
+    while [ $i -lt ${#args[@]} ]; do
+        if [ "${args[$i]}" = "-d" ]; then
+            local payload="${args[$((i+1))]}"
+            echo "$payload" > "$FAKE_ROOT/tmp/last_payload.json"
+            # Verify JSON if jq is available
+            if command -v jq >/dev/null 2>&1; then
+                if ! echo "$payload" | jq . >/dev/null 2>&1; then
+                    echo "ERROR: Invalid JSON payload detected!" >&2
+                    echo "$payload" >&2
+                else
+                    echo "SUCCESS: Valid JSON payload captured." >&2
+                fi
+            fi
+            # Return a mock successful response
+            echo '{"candidates":[{"content":{"parts":[{"text":"STATUS: GOOD\nDIAGNOSIS: Everything looks fine.\nRECOMMENDATIONS:\n- none\nACTION: none"}]}}]}'
+            return 0
+        fi
+        i=$((i+1))
+    done
+    # If not a POST request, just return success
+    return 0
 }
+export -f curl
+
+# Mock logger
+logger() {
+    echo "LOGGER: $*"
+}
+export -f logger
+
+# Load the real script
+# We need to bypass the 'die' on missing config for some tests
+source "$PROJECT_DIR/usr/bin/router-diag" --no-exec
+GEMINI_API_KEY="mock_key"
+GEMINI_MODEL="gemini-1.5-flash"
 
 # --- RUN TEST ---
 echo "--- TEST: LuCI JSON Output ---"
-cmd_luci_json
+cmd_luci_json > /dev/null && echo "LuCI JSON generated successfully."
+
 echo ""
-echo "--- TEST: Prompt Generation ---"
-build_analysis_prompt "2026-05-10 15:00:00,-112,-8,-80,5,30,100,200,0.50,250000,60,61" "test_trigger"
+echo "--- TEST: Prompt Generation & Gemini Request ---"
+# Test with a prompt containing / and " to ensure escaping works
+metrics="2026-05-10 15:00:00,-112,-8,-80,5,30,100,200,0.50,250000,60,61"
+prompt="Test prompt with / and \"quotes\""
+echo "Sending mock request with special characters..."
+gemini_request "$prompt" > /dev/null
+
+if [ -f "$FAKE_ROOT/tmp/last_payload.json" ]; then
+    echo "Captured payload size: $(wc -c < "$FAKE_ROOT/tmp/last_payload.json") bytes"
+    echo "Verifying escaping of special characters in payload..."
+    if grep -q "Test prompt with / and \\\\\"quotes\\\\\"" "$FAKE_ROOT/tmp/last_payload.json"; then
+        echo "SUCCESS: Special characters properly escaped."
+    else
+        echo "ERROR: Escaping failed!"
+        cat "$FAKE_ROOT/tmp/last_payload.json"
+    fi
+fi
