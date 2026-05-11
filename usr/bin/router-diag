@@ -44,9 +44,9 @@ BASE_RSRP="-112"
 BASE_SNR="5"
 MANAGED_SERVICES="dnsmasq adblock-lean https-dns-proxy firewall" # wifi excluded - on D50 ath11k DFS ch128, restart triggers 600s CAC.
 MODEM_IFACE="modem"         # The logical interface name (uci network name)
-PREFERRED_BANDS=""          # If set, Level 4 will restore these (e.g. "1 3 20")
-PREFERRED_CELL=""           # If set, Level 4 will restore this (e.g. "EARFCN,PCI")
-REBOOT_TIMEOUT_MIN=30       # Minutes without internet before Level 4 reboot
+PREFERRED_BANDS=""          # Documentation only on Quectel (NV-persisted via AT+QCFG). Format: "1 3 20"
+PREFERRED_CELL=""           # Documentation only on Quectel (NV-persisted via QNWLOCK save_ctrl). Format: "EARFCN,PCI"
+REBOOT_TIMEOUT_MIN=30       # Minutes without internet before emergency Level 2 reboot
 
 # --- Defaults (overridden by config) ---
 GEMINI_API_KEY=""
