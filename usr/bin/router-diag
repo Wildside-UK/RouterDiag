@@ -125,6 +125,27 @@ at_cmd() {
     safe_run 10 $SMS_TOOL -d "$AT_PORT" at "$cmd"
 }
 
+wifi_in_cac() {
+    # Returns 0 if any 5GHz wireless interface is currently in DFS CAC.
+    # Reads freq and state from a single hostapd_cli call per interface.
+    local iface freq state hostapd_status
+    for iface in $(safe_run 5 iwinfo 2>/dev/null | awk '/^[a-z]/ {print $1}'); do
+        hostapd_status=$(safe_run 5 hostapd_cli -i "$iface" status 2>/dev/null)
+        [ -n "$hostapd_status" ] || continue
+        # Filter to 5GHz (freq starts with 5)
+        freq=$(echo "$hostapd_status" | awk -F= '/^freq=/{print $2}')
+        case "$freq" in
+            5*) ;;
+            *) continue ;;
+        esac
+        state=$(echo "$hostapd_status" | awk -F= '/^state=/{print $2}')
+        case "$state" in
+            DFS|HT_SCAN|ACS) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 json_escape() {
     printf '%s' "$1" | sed 's|\\|\\\\|g; s|"|\\"|g; s|	|\\t|g' | \
         awk '{printf "%s", (NR>1 ? "\\n" : "") $0}'
@@ -2209,6 +2230,11 @@ attempt_fix_wifi() {
         return 1
     fi
 
+    if wifi_in_cac; then
+        log_msg "AUTO-FIX: WiFi fix skipped — 5GHz interface in DFS CAC, not a real failure"
+        return 0
+    fi
+
     # Capture before state
     local before_ssids
     before_ssids=$(safe_run 5 iwinfo | grep "ESSID" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//')
@@ -2368,31 +2394,38 @@ check_network_health() {
     wifi_info=$(safe_run 5 iwinfo)
     wifi_fix_attempted=0
     checked_ssids=""
-    for iface in $(uci show wireless 2>/dev/null | grep '=wifi-iface' | cut -d'=' -f1 | cut -d'.' -f2); do
-        iface_disabled=$(uci -q get "wireless.${iface}.disabled")
-        # Skip disabled or deleted interfaces — not an error
-        [ "$iface_disabled" = "1" ] && continue
-        iface_ssid=$(uci -q get "wireless.${iface}.ssid")
-        [ -z "$iface_ssid" ] && continue
-        # Skip SSIDs already checked (multiple radios can share one SSID)
-        echo "$checked_ssids" | grep -q "|${iface_ssid}|" && continue
-        checked_ssids="${checked_ssids}|${iface_ssid}|"
-        iface_network=$(uci -q get "wireless.${iface}.network")
-        # Check if this SSID is broadcasting
-        if ! echo "$wifi_info" | grep -q "ESSID: \"${iface_ssid}\""; then
-            failed_services="${failed_services}wifi-${iface_ssid},"
-            if [ "$iface_network" = "lan" ]; then
-                critical_fail=1
-            else
-                non_critical_fail=1
+    
+    # Skip WiFi health check during DFS CAC (5GHz channel ch128 on D50 takes 600s).
+    # During CAC the 5GHz SSID legitimately isn't broadcasting; not a failure.
+    if wifi_in_cac; then
+        log_msg "HEALTH: WiFi check skipped — 5GHz interface in DFS CAC"
+    else
+        for iface in $(uci show wireless 2>/dev/null | grep '=wifi-iface' | cut -d'=' -f1 | cut -d'.' -f2); do
+            iface_disabled=$(uci -q get "wireless.${iface}.disabled")
+            # Skip disabled or deleted interfaces — not an error
+            [ "$iface_disabled" = "1" ] && continue
+            iface_ssid=$(uci -q get "wireless.${iface}.ssid")
+            [ -z "$iface_ssid" ] && continue
+            # Skip SSIDs already checked (multiple radios can share one SSID)
+            echo "$checked_ssids" | grep -q "|${iface_ssid}|" && continue
+            checked_ssids="${checked_ssids}|${iface_ssid}|"
+            iface_network=$(uci -q get "wireless.${iface}.network")
+            # Check if this SSID is broadcasting
+            if ! echo "$wifi_info" | grep -q "ESSID: \"${iface_ssid}\""; then
+                failed_services="${failed_services}wifi-${iface_ssid},"
+                if [ "$iface_network" = "lan" ]; then
+                    critical_fail=1
+                else
+                    non_critical_fail=1
+                fi
+                # Only attempt WiFi fix once per health check cycle
+                if [ "$wifi_fix_attempted" = "0" ]; then
+                    wifi_fix_attempted=1
+                    attempt_fix_wifi
+                fi
             fi
-            # Only attempt WiFi fix once per health check cycle
-            if [ "$wifi_fix_attempted" = "0" ]; then
-                wifi_fix_attempted=1
-                attempt_fix_wifi
-            fi
-        fi
-    done
+        done
+    fi
 
     # Remove trailing comma
     failed_services=$(echo "$failed_services" | sed 's/,$//')
@@ -2870,7 +2903,7 @@ check_wifi_thrashing() {
 
         # Find which interface it's on
         local iface
-        iface=$(echo "$new_events" | grep -i "$mac" | grep -oE 'wlan[0-9][-_]?[0-9]*' | tail -1)
+        iface=$(echo "$new_events" | grep -i "$mac" | grep -oE '(wlan[0-9][-_]?[0-9]*|phy[0-9]+-ap[0-9]+)' | tail -1)
         iface="${iface:-unknown}"
 
         # Record notification to prevent spam
