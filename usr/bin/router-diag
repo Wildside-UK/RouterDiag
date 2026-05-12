@@ -2726,7 +2726,7 @@ check_network_conflicts() {
     for dmac in $dup_macs; do
         [ -n "$dmac" ] || continue
         local dup_ips
-        dup_ips=$(echo "$arp_table" | awk -v mac="$dmac" '$5 == mac {print $1}' | sort -u)
+        dup_ips=$(echo "$arp_table" | awk -v mac="$dmac" '$5 == mac {print $1}' | grep -vE '^(169.254|100.|224.|239.|255.)' | sort -u)
         local ip_count
         ip_count=$(echo "$dup_ips" | wc -l)
 
