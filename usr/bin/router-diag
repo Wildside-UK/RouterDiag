@@ -2654,7 +2654,7 @@ check_network_conflicts() {
 
     # Get ARP table (exclude incomplete entries)
     local arp_table
-    arp_table=$(ip neigh show 2>/dev/null | grep -v "FAILED\|INCOMPLETE")
+    arp_table=$(ip -4 neigh show 2>/dev/null | grep -v "FAILED\|INCOMPLETE")
 
     [ -n "$arp_table" ] || {
         echo "No conflicts detected" > /tmp/router-diag-conflicts
